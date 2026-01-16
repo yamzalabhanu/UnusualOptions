@@ -256,3 +256,14 @@ def root():
         "endpoints": ["/health", "/test/telegram", "/control/start", "/control/stop", "/control/reset_cursor"]
     }
 
+@app.get("/debug/uw")
+async def debug_uw():
+    require_env()
+    async with httpx.AsyncClient() as client:
+        alerts = await fetch_flow_alerts(client)
+    return {"count": len(alerts), "sample": alerts[:2]}
+    
+@app.get("/")
+def root():
+    return {"ok": True, "hint": "Use /docs or /health"}
+
