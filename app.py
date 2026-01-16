@@ -247,3 +247,12 @@ def start():
 def reset_cursor():
     state.last_seen_created_at = None
     return {"last_seen_created_at": None}
+
+@app.get("/")
+def root():
+    return {
+        "service": "UW Flow Alerts → Telegram",
+        "status": "ok",
+        "endpoints": ["/health", "/test/telegram", "/control/start", "/control/stop", "/control/reset_cursor"]
+    }
+
