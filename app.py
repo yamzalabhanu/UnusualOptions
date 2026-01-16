@@ -9,7 +9,7 @@ import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-# ----------------------------
+# -----------------------------
 # Config
 # ----------------------------
 UW_BASE_URL = "https://api.unusualwhales.com"
