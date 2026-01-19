@@ -113,6 +113,20 @@ DEFAULT_TICKER_CONFIG: Dict[str, Dict[str, Any]] = {
     "ACHR": {"tier": "T4", "bias": "SPEC", "call_min": 9.0, "put_max": 8.0},
 }
 
+class SimulateAlert(BaseModel):
+    ticker: str
+    side: str            # CALL or PUT
+    strike: float
+    expiry: str
+    premium: float
+    volume: int
+    oi: int
+    price: float         # underlying price
+    delta: Optional[float] = 0.45
+    volume_oi_ratio: Optional[float] = None
+    reason: Optional[str] = "manual simulation"
+
+
 # ----------------------------
 # Helpers
 # ----------------------------
@@ -669,4 +683,78 @@ def root():
         "ok": True,
         "service": "UW Flow Alerts → Telegram (Tier+Zones+Scoring)",
         "endpoints": ["/docs", "/health", "/config", "/debug/uw", "/test/telegram", "/control/start", "/control/stop", "/control/reset_cursor"],
+    }
+@app.post("/simulate/alert")
+async def simulate_alert(body: SimulateAlert):
+    """
+    Simulates a UW flow alert and runs it through
+    the SAME filters, scoring, cooldown, and Telegram formatter.
+    """
+
+    require_env()
+
+    # Build a UW-like payload
+    fake_alert = {
+        "ticker": body.ticker.upper(),
+        "type": body.side.lower(),
+        "strike": body.strike,
+        "expiry": body.expiry,
+        "total_premium": body.premium,
+        "volume": body.volume,
+        "open_interest": body.oi,
+        "volume_oi_ratio": body.volume_oi_ratio or (body.volume / max(body.oi, 1)),
+        "delta": body.delta,
+        "side": "ask",
+        "underlying_price": body.price,
+        "alert_rule": "SIMULATED",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    ticker = fake_alert["ticker"]
+    cfg = TICKER_CONFIG.get(ticker)
+
+    if not cfg:
+        return {"sent": False, "reason": "ticker not in config"}
+
+    tier = cfg["tier"]
+    opt_type = normalize_type(fake_alert["type"])
+
+    # Zone filter
+    ok_zone, why_zone = allow_alert(
+        ticker, opt_type, fake_alert["underlying_price"], tier
+    )
+    if not ok_zone:
+        return {
+            "sent": False,
+            "stage": "zone_filter",
+            "reason": why_zone,
+        }
+
+    # Flow filter
+    ok_flow, why_flow = flow_ok(fake_alert, tier)
+    if not ok_flow:
+        return {
+            "sent": False,
+            "stage": "flow_filter",
+            "reason": why_flow,
+        }
+
+    # Cooldown
+    if not cooldown_ok(fake_alert):
+        return {
+            "sent": False,
+            "stage": "cooldown",
+            "reason": "duplicate within cooldown window",
+        }
+
+    # Send Telegram
+    async with httpx.AsyncClient() as client:
+        await telegram_send(fmt_alert(fake_alert), client)
+
+    return {
+        "sent": True,
+        "ticker": ticker,
+        "tier": tier,
+        "bias": cfg["bias"],
+        "reason": body.reason,
     }
