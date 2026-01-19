@@ -1,10 +1,28 @@
+"""
+app.py — Unusual Whales Flow Alerts → Telegram (Upgraded)
+
+What’s new (based on your “table + logic” request):
+✅ Per-ticker config (Tier/Bias + CALL/PUT price zones)
+✅ Mandatory filters:
+   - Flow quality: premium, ask-side, vol/OI, delta band, DTE band (by tier)
+   - Price zone filter: CALL requires underlying >= call_min, PUT requires underlying <= put_max
+✅ Tier modes (DTE ranges differ for T1/T2/T3/T4)
+✅ Cooldown / de-dupe (prevents spam)
+✅ Scoring (0–100) + “why passed” details in Telegram
+✅ Safe defaults even if you don’t supply a config JSON
+
+Notes:
+- UW flow payload may not include VWAP/ORB. So this update uses what UW reliably provides:
+  underlying_price + contract + premium + side + volume_oi_ratio + delta + expiry/created_at.
+- If your UW payload includes extra fields (like "vwap_ok" or "trend_ok"), you can wire them in.
+"""
+
 import os
 import asyncio
+import json
+import hashlib
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, timezone, timedelta
-from collections import defaultdict, deque
-from math import fabs
-from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI
@@ -22,46 +40,78 @@ TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "15"))
 
-# UW-side filters (server-side filtering)
-TICKERS = [t.strip().upper() for t in os.getenv("TICKERS", "").split(",") if t.strip()]
+# Global filters (baseline; tier + config can override)
 MIN_PREMIUM = float(os.getenv("MIN_PREMIUM", "200000"))
-MIN_DTE = int(os.getenv("MIN_DTE", "1"))
-MIN_VOLUME_OI_RATIO = float(os.getenv("MIN_VOLUME_OI_RATIO", "1.0"))
+MIN_VOLUME_OI_RATIO = float(os.getenv("MIN_VOLUME_OI_RATIO", "1.2"))
+ASK_ONLY = os.getenv("ASK_ONLY", "1").strip() == "1"
+
+# Delta band (common scalp band; you can tune)
+DELTA_MIN = float(os.getenv("DELTA_MIN", "0.30"))
+DELTA_MAX = float(os.getenv("DELTA_MAX", "0.65"))
+
+# Optional UW params
+TICKERS = [t.strip().upper() for t in os.getenv("TICKERS", "").split(",") if t.strip()]
 RULE_NAMES = [x.strip() for x in os.getenv("RULE_NAMES", "").split(",") if x.strip()]
 ISSUE_TYPES = [x.strip() for x in os.getenv("ISSUE_TYPES", "").split(",") if x.strip()]
 
-# Local quality upgrades (client-side scoring/gating)
-SCORE_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "70"))
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "10"))
+# Cooldown (seconds) per unique alert hash
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "600"))  # 10 min default
 
-MIN_OI = int(os.getenv("MIN_OI", "300"))
-MIN_CONTRACT_VOL = int(os.getenv("MIN_CONTRACT_VOL", "200"))
-MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "10"))  # only if bid/ask present
-MAX_STRIKE_DISTANCE_PCT = float(os.getenv("MAX_STRIKE_DISTANCE_PCT", "3.0"))
-MAX_DTE = int(os.getenv("MAX_DTE", "7"))
+# If you want to supply full config via env:
+# TICKER_CONFIG_JSON='{"NVDA":{"tier":"T1","bias":"CALL","call_min":190,"put_max":180}}'
+TICKER_CONFIG_JSON = os.getenv("TICKER_CONFIG_JSON", "").strip()
 
-MAX_ALERTS_PER_TICKER_WINDOW = int(os.getenv("MAX_ALERTS_PER_TICKER_WINDOW", "3"))
-RATE_WINDOW_SECONDS = int(os.getenv("RATE_WINDOW_SECONDS", "120"))
+# ----------------------------
+# Default Ticker Config (from your master table)
+# - call_min: underlying must be >= this for CALL alerts
+# - put_max : underlying must be <= this for PUT alerts
+# - bias    : preferred direction (CALL/PUT/NEUTRAL/SPEC)
+# - tier    : T1..T4 affects DTE band and strictness
+# ----------------------------
+DEFAULT_TICKER_CONFIG: Dict[str, Dict[str, Any]] = {
+    # Tech / AI / Growth
+    "NVDA": {"tier": "T1", "bias": "CALL", "call_min": 190.0, "put_max": 180.0},
+    "AMD":  {"tier": "T1", "bias": "CALL", "call_min": 225.0, "put_max": 210.0},
+    "MU":   {"tier": "T1", "bias": "CALL", "call_min": 350.0, "put_max": 330.0},
+    "PLTR": {"tier": "T2", "bias": "NEUTRAL", "call_min": 185.0, "put_max": 175.0},
+    "MSFT": {"tier": "T2", "bias": "PUT", "call_min": 480.0, "put_max": 470.0},
+    "META": {"tier": "T2", "bias": "MIXED", "call_min": 650.0, "put_max": 630.0},
+    "CRWD": {"tier": "T2", "bias": "CALL", "call_min": 460.0, "put_max": 440.0},
+    "SNOW": {"tier": "T3", "bias": "PUT", "call_min": 235.0, "put_max": 215.0},
+    "CRM":  {"tier": "T3", "bias": "PUT", "call_min": 250.0, "put_max": 235.0},
+    "TTD":  {"tier": "T3", "bias": "PUT", "call_min": 45.0, "put_max": 40.0},
+    "OKLO": {"tier": "T4", "bias": "SPEC", "call_min": 100.0, "put_max": 90.0},
+    "RGTI": {"tier": "T4", "bias": "SPEC", "call_min": 28.0, "put_max": 24.0},
 
-RULE_WEIGHTS = {
-    "Sweep": 25,
-    "Sweeps": 25,
-    "RepeatedHits": 18,
-    "RepeatedHitsAscendingFill": 20,
-    "RepeatedHitsDescendingFill": 20,
-    "Block": 12,
+    # Consumer / Retail / Defensive
+    "PG":   {"tier": "T2", "bias": "NEUTRAL", "call_min": 148.0, "put_max": 142.0},
+    "MCD":  {"tier": "T2", "bias": "NEUTRAL", "call_min": 310.0, "put_max": 300.0},
+    "HD":   {"tier": "T2", "bias": "CALL", "call_min": 380.0, "put_max": 360.0},
+    "LULU": {"tier": "T3", "bias": "PUT", "call_min": 215.0, "put_max": 200.0},
+    "NKE":  {"tier": "T3", "bias": "PUT", "call_min": 68.0, "put_max": 66.0},
+    "DKNG": {"tier": "T3", "bias": "PUT", "call_min": 36.0, "put_max": 33.0},
+    "RKT":  {"tier": "T2", "bias": "CALL", "call_min": 23.0, "put_max": 21.0},
+    "PDD":  {"tier": "T3", "bias": "PUT", "call_min": 120.0, "put_max": 110.0},
+    "PLNT": {"tier": "T3", "bias": "PUT", "call_min": 104.0, "put_max": 102.0},
+    "OPEN": {"tier": "T4", "bias": "SPEC", "call_min": 7.5, "put_max": 6.0},
+    "F":    {"tier": "T2", "bias": "CALL", "call_min": 13.2, "put_max": 12.8},
+    "PFE":  {"tier": "T2", "bias": "NEUTRAL", "call_min": 26.5, "put_max": 25.0},
+
+    # Energy / Industrial / Macro
+    "XOM":  {"tier": "T1", "bias": "CALL", "call_min": 122.0, "put_max": 115.0},
+    "CVX":  {"tier": "T1", "bias": "CALL", "call_min": 158.0, "put_max": 150.0},
+    "OXY":  {"tier": "T2", "bias": "CALL", "call_min": 42.0, "put_max": 40.0},
+    "GE":   {"tier": "T1", "bias": "CALL", "call_min": 315.0, "put_max": 300.0},
+    "BA":   {"tier": "T2", "bias": "CALL", "call_min": 245.0, "put_max": 230.0},
+    "UNH":  {"tier": "T2", "bias": "NEUTRAL", "call_min": 345.0, "put_max": 330.0},
+    "UPS":  {"tier": "T2", "bias": "CALL", "call_min": 102.0, "put_max": 100.0},
+    "V":    {"tier": "T2", "bias": "PUT", "call_min": 350.0, "put_max": 345.0},
+    "MSTR": {"tier": "T3", "bias": "BTC", "call_min": 200.0, "put_max": 175.0},
+    "CIFR": {"tier": "T3", "bias": "SPEC", "call_min": 19.0, "put_max": 16.0},
+    "SMR":  {"tier": "T4", "bias": "SPEC", "call_min": 22.0, "put_max": 18.0},
+    "ARM":  {"tier": "T3", "bias": "PUT", "call_min": 132.0, "put_max": 120.0},
+    "ACHR": {"tier": "T4", "bias": "SPEC", "call_min": 9.0, "put_max": 8.0},
 }
-
-# Trend confirmation (Polygon)
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
-CONFIRM_STRICT = os.getenv("CONFIRM_STRICT", "true").lower() == "true"
-CONFIRM_TTL_SECONDS = int(os.getenv("CONFIRM_TTL_SECONDS", "20"))
-ORB_MINUTES = int(os.getenv("ORB_MINUTES", "15"))
-
-CONFIRM_VWAP_REQUIRED = os.getenv("CONFIRM_VWAP_REQUIRED", "true").lower() == "true"
-CONFIRM_ORB_REQUIRED = os.getenv("CONFIRM_ORB_REQUIRED", "true").lower() == "true"
-
-NY_TZ = ZoneInfo("America/New_York")
 
 # ----------------------------
 # Helpers
@@ -74,11 +124,8 @@ def require_env():
         missing.append("TELEGRAM_BOT_TOKEN")
     if not TG_CHAT_ID:
         missing.append("TELEGRAM_CHAT_ID")
-    if CONFIRM_STRICT and not POLYGON_API_KEY:
-        missing.append("POLYGON_API_KEY (required when CONFIRM_STRICT=true)")
     if missing:
         raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
-
 
 def uw_headers() -> Dict[str, str]:
     return {
@@ -86,205 +133,287 @@ def uw_headers() -> Dict[str, str]:
         "Authorization": UW_TOKEN,
     }
 
-
 def parse_iso(dt_str: str) -> datetime:
+    if not dt_str:
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
     if dt_str.endswith("Z"):
         dt_str = dt_str.replace("Z", "+00:00")
     return datetime.fromisoformat(dt_str)
 
-
 def money(x: Optional[float]) -> str:
     if x is None:
         return "n/a"
+    return f"${x:,.0f}"
+
+def safe_float(x, default=None):
     try:
-        return f"${float(x):,.0f}"
-    except Exception:
-        return "n/a"
-
-
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-
-def safe_float(v, default=None):
-    try:
-        if v is None:
+        if x is None:
             return default
-        return float(v)
+        return float(x)
     except Exception:
         return default
 
-
-def safe_int(v, default=None):
+def safe_int(x, default=None):
     try:
-        if v is None:
+        if x is None:
             return default
-        return int(float(v))
+        return int(float(x))
     except Exception:
         return default
 
-
-def contract_key(a: Dict[str, Any]) -> str:
-    if a.get("option_chain"):
-        return str(a["option_chain"])
-    return f'{a.get("ticker")}:{a.get("expiry")}:{a.get("strike")}:{a.get("type")}'
-
-
-def calc_dte(a: Dict[str, Any]) -> Optional[int]:
-    exp = a.get("expiry")
-    if not exp:
+def days_to_expiry(expiry: Optional[str], now: datetime) -> Optional[int]:
+    if not expiry:
         return None
+    # expiry may be "2026-01-17" or ISO; handle both
     try:
-        exp_dt = datetime.fromisoformat(str(exp)).replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
+        if "T" in expiry:
+            exp_dt = parse_iso(expiry)
+        else:
+            exp_dt = datetime.fromisoformat(expiry).replace(tzinfo=timezone.utc)
         return max(0, (exp_dt.date() - now.date()).days)
     except Exception:
         return None
 
+def load_ticker_config() -> Dict[str, Dict[str, Any]]:
+    cfg = dict(DEFAULT_TICKER_CONFIG)
+    if TICKER_CONFIG_JSON:
+        try:
+            override = json.loads(TICKER_CONFIG_JSON)
+            # merge override
+            for k, v in override.items():
+                cfg[k.upper()] = {**cfg.get(k.upper(), {}), **v}
+        except Exception:
+            # if bad json, keep defaults
+            pass
+    return cfg
 
-def strike_distance_pct(a: Dict[str, Any]) -> Optional[float]:
-    strike = safe_float(a.get("strike"))
-    und = safe_float(a.get("underlying_price"))
-    if strike is None or und is None or und <= 0:
-        return None
-    return 100.0 * fabs(strike - und) / und
+TICKER_CONFIG = load_ticker_config()
 
+def tier_dte_range(tier: str) -> Tuple[int, int]:
+    # Tier-based expiry windows (from your logic)
+    t = (tier or "T2").upper()
+    if t == "T1":
+        return (14, 45)
+    if t == "T2":
+        return (7, 30)
+    if t == "T3":
+        return (7, 21)
+    return (3, 14)  # T4
 
-def spread_pct(a: Dict[str, Any]) -> Optional[float]:
-    bid = safe_float(a.get("bid"))
-    ask = safe_float(a.get("ask"))
-    if bid is None or ask is None or ask <= 0:
-        return None
-    mid = (bid + ask) / 2.0
-    if mid <= 0:
-        return None
-    return 100.0 * (ask - bid) / mid
+def normalize_type(opt_type: Any) -> str:
+    s = str(opt_type or "").lower()
+    if "call" in s:
+        return "CALL"
+    if "put" in s:
+        return "PUT"
+    # UW sometimes uses "c"/"p"
+    if s in ("c",):
+        return "CALL"
+    if s in ("p",):
+        return "PUT"
+    return s.upper() if s else "UNK"
 
+def get_underlying_price(a: Dict[str, Any]) -> Optional[float]:
+    # Common UW field names:
+    for k in ("underlying_price", "underlying", "stock_price", "spot_price"):
+        v = safe_float(a.get(k))
+        if v is not None:
+            return v
+    return None
 
-def time_of_day_bonus() -> int:
-    hour = datetime.now(timezone.utc).hour
-    if 14 <= hour <= 16:
-        return 8
-    if 19 <= hour <= 21:
-        return 6
-    return 0
+def get_premium(a: Dict[str, Any]) -> Optional[float]:
+    for k in ("total_premium", "premium", "notional", "total_notional"):
+        v = safe_float(a.get(k))
+        if v is not None:
+            return v
+    return None
 
+def get_vol_oi(a: Dict[str, Any]) -> Optional[float]:
+    for k in ("volume_oi_ratio", "vol_oi_ratio", "volume_oi", "vol_oi"):
+        v = safe_float(a.get(k))
+        if v is not None:
+            return v
+    return None
 
-def liquidity_gate(a: Dict[str, Any]) -> Tuple[bool, List[str]]:
+def get_side(a: Dict[str, Any]) -> str:
+    # common values: ask/bid/mid/unknown
+    s = str(a.get("side") or a.get("trade_side") or "").lower()
+    return s
+
+def get_delta(a: Dict[str, Any]) -> Optional[float]:
+    return safe_float(a.get("delta") or a.get("option_delta"))
+
+def get_expiry(a: Dict[str, Any]) -> Optional[str]:
+    return a.get("expiry") or a.get("expiration") or a.get("exp_date")
+
+def get_strike(a: Dict[str, Any]) -> Optional[float]:
+    return safe_float(a.get("strike"))
+
+def get_ticker(a: Dict[str, Any]) -> str:
+    return str(a.get("ticker") or a.get("symbol") or "UNK").upper()
+
+def get_rule(a: Dict[str, Any]) -> str:
+    return a.get("alert_rule") or a.get("rule_name") or a.get("rule") or "FLOW"
+
+def alert_id(a: Dict[str, Any]) -> str:
+    """
+    Build a stable-ish hash for cooldown + dedupe.
+    Uses ticker + type + strike + expiry + created_at + premium + size.
+    """
+    parts = [
+        get_ticker(a),
+        normalize_type(a.get("type")),
+        str(get_strike(a) or ""),
+        str(get_expiry(a) or ""),
+        str(a.get("created_at") or ""),
+        str(get_premium(a) or ""),
+        str(a.get("total_size") or a.get("size") or ""),
+    ]
+    raw = "|".join(parts).encode("utf-8", errors="ignore")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+# ----------------------------
+# Filters + Scoring
+# ----------------------------
+def allow_alert(ticker: str, opt_type: str, underlying: float, tier: str) -> Tuple[bool, List[str]]:
+    """
+    Mandatory zone filter based on your table:
+    - CALL requires underlying >= call_min
+    - PUT  requires underlying <= put_max
+    - Also enforces: no puts on T4 by default (noise suppression)
+    """
     reasons = []
+    cfg = TICKER_CONFIG.get(ticker, {"tier": tier, "bias": "NEUTRAL", "call_min": None, "put_max": None})
+    t = (cfg.get("tier") or tier or "T2").upper()
+    call_min = safe_float(cfg.get("call_min"))
+    put_max = safe_float(cfg.get("put_max"))
 
-    oi = safe_int(a.get("open_interest"))
-    vol = safe_int(a.get("volume"))
+    if t == "T4" and opt_type == "PUT":
+        return False, ["T4_puts_blocked"]
 
-    if oi is not None and oi < MIN_OI:
-        reasons.append(f"OI<{MIN_OI}")
-    if vol is not None and vol < MIN_CONTRACT_VOL:
-        reasons.append(f"VOL<{MIN_CONTRACT_VOL}")
+    if opt_type == "CALL" and call_min is not None and underlying < call_min:
+        return False, [f"underlying<{call_min:g}"]
+    if opt_type == "PUT" and put_max is not None and underlying > put_max:
+        return False, [f"underlying>{put_max:g}"]
 
-    dte = calc_dte(a)
-    if dte is not None and dte > MAX_DTE:
-        reasons.append(f"DTE>{MAX_DTE}")
+    reasons.append("zone_ok")
+    return True, reasons
 
-    dist = strike_distance_pct(a)
-    if dist is not None and dist > MAX_STRIKE_DISTANCE_PCT:
-        reasons.append(f"StrikeDist>{MAX_STRIKE_DISTANCE_PCT:.1f}%")
+def flow_ok(a: Dict[str, Any], tier: str) -> Tuple[bool, List[str]]:
+    """
+    Flow quality filter:
+    - premium >= MIN_PREMIUM
+    - ask side (if ASK_ONLY enabled)
+    - vol/oi >= MIN_VOLUME_OI_RATIO
+    - delta within band
+    - dte within tier range
+    """
+    reasons = []
+    now = datetime.now(timezone.utc)
 
-    sp = spread_pct(a)
-    if sp is not None and sp > MAX_SPREAD_PCT:
-        reasons.append(f"Spread>{MAX_SPREAD_PCT:.0f}%")
+    premium = get_premium(a)
+    if premium is None or premium < MIN_PREMIUM:
+        return False, ["premium_low"]
 
-    return (len(reasons) == 0, reasons)
+    side = get_side(a)
+    if ASK_ONLY and side and side != "ask":
+        return False, [f"side_{side}"]
 
+    vol_oi = get_vol_oi(a)
+    if vol_oi is None or vol_oi < MIN_VOLUME_OI_RATIO:
+        return False, ["voloi_low"]
 
-def score_alert(a: Dict[str, Any]) -> Tuple[float, List[str]]:
-    reasons: List[str] = []
-    score = 0.0
-
-    premium = safe_float(a.get("total_premium"), 0.0) or 0.0
-    voi = safe_float(a.get("volume_oi_ratio"), 0.0) or 0.0
-    rule = (a.get("alert_rule") or a.get("rule_name") or a.get("rule") or "").strip()
-
-    if premium >= 1_000_000:
-        score += 28
-        reasons.append("Premium>=1M")
-    elif premium >= 500_000:
-        score += 22
-        reasons.append("Premium>=500k")
-    elif premium >= 200_000:
-        score += 16
-        reasons.append("Premium>=200k")
-    elif premium >= 75_000:
-        score += 10
-        reasons.append("Premium>=75k")
+    delta = get_delta(a)
+    if delta is not None:
+        if abs(delta) < DELTA_MIN or abs(delta) > DELTA_MAX:
+            return False, ["delta_out_of_band"]
     else:
-        score += 4
+        # if missing delta, be stricter for T1/T2, lenient for T3/T4
+        if (tier or "").upper() in ("T1", "T2"):
+            return False, ["delta_missing"]
 
-    if voi >= 5:
-        score += 28
-        reasons.append("Vol/OI>=5")
-    elif voi >= 3:
-        score += 22
-        reasons.append("Vol/OI>=3")
-    elif voi >= 2:
-        score += 16
-        reasons.append("Vol/OI>=2")
-    elif voi >= 1:
-        score += 10
-        reasons.append("Vol/OI>=1")
-    else:
-        score += 2
-
-    rw = 0
-    for k, w in RULE_WEIGHTS.items():
-        if k.lower() in rule.lower():
-            rw = max(rw, w)
-    if rw:
-        score += rw
-        reasons.append(f"Rule:{rule}")
-
-    dte = calc_dte(a)
+    dte = days_to_expiry(get_expiry(a), now)
     if dte is not None:
-        if dte <= 2:
-            score += 12
-            reasons.append("DTE<=2")
-        elif dte <= 7:
-            score += 8
-            reasons.append("DTE<=7")
-        else:
-            score -= 10
-            reasons.append("DTE>7")
+        dmin, dmax = tier_dte_range(tier)
+        if dte < dmin or dte > dmax:
+            return False, [f"dte_{dte}_out_{dmin}-{dmax}"]
+    else:
+        # if missing DTE/expiry, be strict for T1/T2
+        if (tier or "").upper() in ("T1", "T2"):
+            return False, ["expiry_missing"]
 
-    dist = strike_distance_pct(a)
-    if dist is not None:
-        if dist <= 1.0:
-            score += 10
-            reasons.append("NearATM<=1%")
-        elif dist <= 3.0:
-            score += 6
-            reasons.append("NearATM<=3%")
-        else:
-            score -= 8
-            reasons.append("FarOTM")
+    reasons.append("flow_ok")
+    return True, reasons
 
-    sp = spread_pct(a)
-    if sp is not None:
-        if sp <= 5:
-            score += 6
-            reasons.append("TightSpread<=5%")
-        elif sp <= 10:
-            score += 2
-        else:
-            score -= 12
-            reasons.append("WideSpread")
+def score_alert(ticker: str, opt_type: str, a: Dict[str, Any]) -> Tuple[int, List[str]]:
+    """
+    Simple 0–100 score. Higher = better.
+    Scoring uses premium, vol/oi, side=ask, delta closeness, tier.
+    """
+    cfg = TICKER_CONFIG.get(ticker, {})
+    tier = (cfg.get("tier") or "T2").upper()
+    bias = (cfg.get("bias") or "NEUTRAL").upper()
 
-    tb = time_of_day_bonus()
-    if tb:
-        score += tb
-        reasons.append("TimeBonus")
+    score = 50
+    why = []
 
-    return clamp(score, 0, 100), reasons
+    # Tier weight
+    if tier == "T1":
+        score += 15; why.append("tier_T1")
+    elif tier == "T2":
+        score += 8; why.append("tier_T2")
+    elif tier == "T3":
+        score += 0; why.append("tier_T3")
+    else:
+        score -= 8; why.append("tier_T4")
 
+    # Bias alignment
+    if bias in ("CALL", "PUT") and bias == opt_type:
+        score += 10; why.append("bias_aligned")
+    elif bias == "NEUTRAL":
+        score += 0; why.append("bias_neutral")
+    else:
+        score -= 5; why.append("bias_not_aligned")
 
+    # Ask-side bonus
+    if get_side(a) == "ask":
+        score += 8; why.append("ask_side")
+
+    # vol/oi bonus
+    vol_oi = get_vol_oi(a)
+    if vol_oi is not None:
+        if vol_oi >= 3.0:
+            score += 12; why.append("voloi_3+")
+        elif vol_oi >= 2.0:
+            score += 8; why.append("voloi_2+")
+        elif vol_oi >= 1.2:
+            score += 4; why.append("voloi_1.2+")
+
+    # premium bonus
+    prem = get_premium(a) or 0
+    if prem >= 1_000_000:
+        score += 12; why.append("prem_1m+")
+    elif prem >= 500_000:
+        score += 8; why.append("prem_500k+")
+    elif prem >= 200_000:
+        score += 4; why.append("prem_200k+")
+
+    # delta preference around ~0.40–0.55 for scalps
+    d = get_delta(a)
+    if d is not None:
+        ad = abs(d)
+        if 0.40 <= ad <= 0.55:
+            score += 8; why.append("delta_sweetspot")
+        elif 0.30 <= ad < 0.40 or 0.55 < ad <= 0.65:
+            score += 3; why.append("delta_ok")
+
+    # clamp
+    score = max(0, min(100, score))
+    return score, why
+
+# ----------------------------
+# Telegram
+# ----------------------------
 async def telegram_send(text: str, client: httpx.AsyncClient) -> None:
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {
@@ -296,242 +425,64 @@ async def telegram_send(text: str, client: httpx.AsyncClient) -> None:
     r = await client.post(url, json=payload, timeout=20)
     r.raise_for_status()
 
+def fmt_alert(a: Dict[str, Any]) -> str:
+    ticker = get_ticker(a)
+    cfg = TICKER_CONFIG.get(ticker, {"tier": "T2", "bias": "NEUTRAL"})
+    tier = (cfg.get("tier") or "T2").upper()
+    bias = (cfg.get("bias") or "NEUTRAL").upper()
 
-def fmt_alert(
-    a: Dict[str, Any],
-    score: Optional[float] = None,
-    reasons: Optional[List[str]] = None,
-    bias: Optional[str] = None,
-    confirm: Optional[Dict[str, Any]] = None,
-    confirm_notes: Optional[List[str]] = None,
-) -> str:
-    ticker = a.get("ticker", "UNK")
-    opt_type = str(a.get("type", "")).upper()
-    strike = a.get("strike")
-    expiry = a.get("expiry")
-    rule = a.get("alert_rule") or a.get("rule_name") or a.get("rule") or "FLOW"
+    opt_type = normalize_type(a.get("type"))
+    strike = get_strike(a)
+    expiry = get_expiry(a)
+    rule = get_rule(a)
     created_at = a.get("created_at")
 
-    total_premium = a.get("total_premium")
-    total_size = a.get("total_size")
+    prem = get_premium(a)
+    size = a.get("total_size") or a.get("size")
     vol = a.get("volume")
     oi = a.get("open_interest")
-    voi = a.get("volume_oi_ratio")
+    voloi = get_vol_oi(a)
+    delta = get_delta(a)
+    side = get_side(a)
+    underlying = get_underlying_price(a)
+    chain = a.get("option_chain") or a.get("contract") or a.get("symbol")
 
-    underlying = a.get("underlying_price")
-    opt_price = a.get("price")
-    chain = a.get("option_chain")
+    score, why = score_alert(ticker, opt_type, a)
+
+    # Zones (for display)
+    call_min = cfg.get("call_min")
+    put_max = cfg.get("put_max")
+    zone_line = f"• Zones: CALL ≥ *{call_min}* | PUT ≤ *{put_max}*" if (call_min is not None and put_max is not None) else "• Zones: n/a"
 
     lines = [
-        f"🚨 *UW Flow Alert* — *{ticker}*",
-        f"• Rule: `{rule}`",
+        f"🚨 *UW Flow Alert* — *{ticker}*  |  *Score:* `{score}/100`",
+        f"• Tier/Bias: `{tier}` / `{bias}`",
+        f"• Rule: `{rule}` | Side: `{side or 'n/a'}`",
+        zone_line,
         f"• Contract: `{chain}`" if chain else f"• {opt_type} {strike} @ {expiry}",
-        f"• Option Px: `{opt_price}` | Underlying: `{underlying}`",
-        f"• Premium: *{money(total_premium)}* | Size: `{total_size}`",
-        f"• Vol: `{vol}` | OI: `{oi}` | Vol/OI: `{voi}`",
+        f"• Underlying: `{underlying}` | Δ: `{delta}` | Vol/OI: `{voloi}`",
+        f"• Premium: *{money(prem)}* | Size: `{size}` | Vol: `{vol}` | OI: `{oi}`",
+        f"• Why: `{', '.join(why[:6])}`",
         f"• Time: `{created_at}`",
     ]
-
-    if bias:
-        lines.append(f"\n🧭 *Bias:* `{bias.upper()}`")
-
-    if score is not None:
-        lines.append(f"⭐ *Score:* `{score:.0f}/100`")
-    if reasons:
-        lines.append("✅ *Why:* " + ", ".join([f"`{r}`" for r in reasons[:6]]))
-
-    if confirm is not None:
-        lines.append("\n📈 *Trend Confirm*")
-        if confirm.get("ok"):
-            lines.append(
-                f"• Last: `{confirm.get('last')}` | VWAP: `{confirm.get('vwap')}`"
-            )
-            lines.append(
-                f"• ORB{ORB_MINUTES} High: `{confirm.get('orb_high')}` | ORB{ORB_MINUTES} Low: `{confirm.get('orb_low')}`"
-            )
-        else:
-            lines.append(f"• Unavailable: `{confirm.get('reason')}`")
-        if confirm_notes:
-            lines.append("• Notes: " + ", ".join([f"`{x}`" for x in confirm_notes[:3]]))
-
     return "\n".join(lines)
 
 # ----------------------------
-# Bias + Trend Confirmation (Polygon VWAP/ORB)
-# ----------------------------
-_confirm_cache: Dict[str, Any] = {}
-
-def _now_ny() -> datetime:
-    return datetime.now(timezone.utc).astimezone(NY_TZ)
-
-def _session_day_ny() -> str:
-    return _now_ny().date().isoformat()
-
-def _market_window_ny() -> Tuple[datetime, datetime]:
-    now = _now_ny()
-    start = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    end = now.replace(hour=16, minute=0, second=0, microsecond=0)
-    return start, end
-
-async def polygon_get_minute_bars(ticker: str, client: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    day = _session_day_ny()
-    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/{day}/{day}"
-    params = {
-        "adjusted": "true",
-        "sort": "asc",
-        "limit": 50000,
-        "apiKey": POLYGON_API_KEY,
-    }
-    r = await client.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("results") or []
-
-def compute_vwap_and_orb(bars: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if not bars:
-        return {"ok": False, "reason": "no_bars"}
-
-    start, end = _market_window_ny()
-    now = _now_ny()
-
-    session_bars: List[Tuple[datetime, Dict[str, Any]]] = []
-    for b in bars:
-        ts = datetime.fromtimestamp(b["t"] / 1000, tz=timezone.utc).astimezone(NY_TZ)
-        if ts < start or ts > end:
-            continue
-        if ts > now:
-            continue
-        session_bars.append((ts, b))
-
-    if len(session_bars) < ORB_MINUTES:
-        return {"ok": False, "reason": "insufficient_session_bars", "count": len(session_bars)}
-
-    orb_end = start + timedelta(minutes=ORB_MINUTES)
-    orb_bars = [b for (ts, b) in session_bars if start <= ts < orb_end]
-    if not orb_bars:
-        return {"ok": False, "reason": "no_orb_bars"}
-
-    orb_high = max(float(b.get("h", 0) or 0) for b in orb_bars)
-    orb_low = min(float(b.get("l", 0) or 0) for b in orb_bars)
-
-    pv_sum = 0.0
-    v_sum = 0.0
-    for _, b in session_bars:
-        v = float(b.get("v", 0) or 0)
-        if v <= 0:
-            continue
-        h = float(b.get("h", 0) or 0)
-        l = float(b.get("l", 0) or 0)
-        c = float(b.get("c", 0) or 0)
-        tp = (h + l + c) / 3.0
-        pv_sum += tp * v
-        v_sum += v
-
-    vwap = (pv_sum / v_sum) if v_sum > 0 else None
-    last = float(session_bars[-1][1].get("c", 0) or 0)
-
-    return {
-        "ok": True,
-        "last": last,
-        "vwap": vwap,
-        "orb_high": orb_high,
-        "orb_low": orb_low,
-        "session_bars": len(session_bars),
-    }
-
-async def get_confirmation_metrics(ticker: str, client: httpx.AsyncClient) -> Dict[str, Any]:
-    now_epoch = datetime.now(timezone.utc).timestamp()
-    cached = _confirm_cache.get(ticker)
-    if cached and cached["exp"] > now_epoch:
-        return cached["val"]
-
-    if not POLYGON_API_KEY:
-        val = {"ok": False, "reason": "missing_polygon_key"}
-        _confirm_cache[ticker] = {"exp": now_epoch + CONFIRM_TTL_SECONDS, "val": val}
-        return val
-
-    bars = await polygon_get_minute_bars(ticker, client)
-    metrics = compute_vwap_and_orb(bars)
-    _confirm_cache[ticker] = {"exp": now_epoch + CONFIRM_TTL_SECONDS, "val": metrics}
-    return metrics
-
-def infer_bias(a: Dict[str, Any]) -> str:
-    t = str(a.get("type", "")).lower()
-    if "call" in t or t == "c":
-        return "bull"
-    if "put" in t or t == "p":
-        return "bear"
-    return "unknown"
-
-def confirmation_passes(bias: str, m: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    if not m.get("ok"):
-        return (False, [f"confirm_unavailable:{m.get('reason')}"])
-
-    last = m.get("last")
-    vwap = m.get("vwap")
-    orb_high = m.get("orb_high")
-    orb_low = m.get("orb_low")
-
-    if last is None:
-        return (False, ["no_last"])
-
-    reasons: List[str] = []
-
-    if CONFIRM_VWAP_REQUIRED:
-        if vwap is None:
-            return (False, ["no_vwap"])
-        if bias == "bull" and not (last > vwap):
-            reasons.append("below_vwap")
-        if bias == "bear" and not (last < vwap):
-            reasons.append("above_vwap")
-
-    if CONFIRM_ORB_REQUIRED:
-        if orb_high is None or orb_low is None:
-            return (False, ["no_orb"])
-        if bias == "bull" and not (last > orb_high):
-            reasons.append("below_orb_high")
-        if bias == "bear" and not (last < orb_low):
-            reasons.append("above_orb_low")
-
-    return (len(reasons) == 0, reasons)
-
-# ----------------------------
-# Core poller state + dedupe
+# Core poller
 # ----------------------------
 class State:
     running: bool = False
     last_seen_created_at: Optional[str] = None
+    cooldown: Dict[str, datetime] = {}  # alert_hash -> last_sent_time
 
 state = State()
-
-_seen_contracts: Dict[str, datetime] = {}
-_ticker_recent: Dict[str, deque] = defaultdict(deque)
-
-def cooldown_ok(a: Dict[str, Any]) -> bool:
-    key = contract_key(a)
-    now = datetime.now(timezone.utc)
-    last = _seen_contracts.get(key)
-    if last and (now - last).total_seconds() < COOLDOWN_MINUTES * 60:
-        return False
-    _seen_contracts[key] = now
-    return True
-
-def ticker_rate_limit_ok(ticker: str) -> bool:
-    now = datetime.now(timezone.utc)
-    q = _ticker_recent[ticker]
-    while q and (now - q[0]).total_seconds() > RATE_WINDOW_SECONDS:
-        q.popleft()
-    if len(q) >= MAX_ALERTS_PER_TICKER_WINDOW:
-        return False
-    q.append(now)
-    return True
 
 async def fetch_flow_alerts(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     params: Dict[str, Any] = {}
 
     if ISSUE_TYPES:
         params["issue_types[]"] = ISSUE_TYPES
-    params["min_dte"] = MIN_DTE
+    # Keep UW endpoint filters light; do most logic locally
     params["min_premium"] = MIN_PREMIUM
     params["min_volume_oi_ratio"] = MIN_VOLUME_OI_RATIO
     if RULE_NAMES:
@@ -561,6 +512,7 @@ def dedupe_and_sort(alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     alerts_sorted = sorted(alerts, key=key)
 
     if not state.last_seen_created_at:
+        # first run: avoid spamming old history
         return alerts_sorted[-10:]
 
     last_dt = parse_iso(state.last_seen_created_at)
@@ -576,6 +528,19 @@ def dedupe_and_sort(alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
     return fresh
 
+def cooldown_ok(a: Dict[str, Any]) -> bool:
+    h = alert_id(a)
+    now = datetime.now(timezone.utc)
+    last = state.cooldown.get(h)
+    if last and (now - last).total_seconds() < COOLDOWN_SECONDS:
+        return False
+    state.cooldown[h] = now
+    # prune occasionally
+    if len(state.cooldown) > 5000:
+        cutoff = now - timedelta(seconds=COOLDOWN_SECONDS * 3)
+        state.cooldown = {k: v for k, v in state.cooldown.items() if v >= cutoff}
+    return True
+
 async def poll_loop():
     require_env()
     state.running = True
@@ -587,57 +552,43 @@ async def poll_loop():
                 fresh = dedupe_and_sort(alerts)
 
                 for a in fresh:
+                    ticker = get_ticker(a)
+                    cfg = TICKER_CONFIG.get(ticker)
+
+                    # If user restricted tickers, we already filtered; if not, you can choose to only alert
+                    # on tickers we have config for:
+                    if cfg is None and not TICKERS:
+                        # Skip unknown tickers to reduce noise
+                        continue
+
+                    tier = (cfg.get("tier") if cfg else "T2") or "T2"
+                    opt_type = normalize_type(a.get("type"))
+                    underlying = get_underlying_price(a)
+
+                    # Must have underlying for zone logic
+                    if underlying is None:
+                        continue
+
+                    ok_zone, why_zone = allow_alert(ticker, opt_type, underlying, tier)
+                    if not ok_zone:
+                        continue
+
+                    ok_flow, why_flow = flow_ok(a, tier)
+                    if not ok_flow:
+                        continue
+
                     if not cooldown_ok(a):
                         continue
 
-                    ticker = (a.get("ticker") or "UNK").upper()
-                    if not ticker_rate_limit_ok(ticker):
-                        continue
-
-                    ok, _gate_reasons = liquidity_gate(a)
-                    if not ok:
-                        continue
-
-                    sc, sc_reasons = score_alert(a)
-                    if sc < SCORE_THRESHOLD:
-                        continue
-
-                    bias = infer_bias(a)
-
-                    # Trend confirmation (VWAP + ORB)
-                    confirm = None
-                    confirm_notes: List[str] = []
-                    confirm_ok = True
-
-                    if bias in ("bull", "bear"):
-                        confirm = await get_confirmation_metrics(ticker, client)
-                        confirm_ok, confirm_notes = confirmation_passes(bias, confirm)
-
-                        if not confirm_ok and CONFIRM_STRICT:
-                            continue
-
-                        # Score adjust based on confirmation
-                        if confirm_ok:
-                            sc = min(100, sc + 10)
-                            sc_reasons = sc_reasons + [f"CONFIRM:{bias.upper()}"]
-                        else:
-                            sc = max(0, sc - 10)
-                            sc_reasons = sc_reasons + [f"NO_CONFIRM:{','.join(confirm_notes[:2])}"]
-
-                    msg = fmt_alert(
-                        a,
-                        score=sc,
-                        reasons=sc_reasons,
-                        bias=bias if bias != "unknown" else None,
-                        confirm=confirm,
-                        confirm_notes=confirm_notes if confirm_notes else None,
-                    )
+                    # Passed all filters -> send
+                    msg = fmt_alert(a) + f"\n• Passed: `{', '.join(why_zone + why_flow)}`"
                     await telegram_send(msg, client)
 
                     if a.get("created_at"):
                         state.last_seen_created_at = a["created_at"]
 
             except Exception:
+                # keep running; don't spam TG on transient errors
                 pass
 
             await asyncio.sleep(POLL_SECONDS)
@@ -645,7 +596,7 @@ async def poll_loop():
 # ----------------------------
 # FastAPI app
 # ----------------------------
-app = FastAPI(title="UW Flow Alerts → Telegram (Scored + VWAP/ORB Confirmed)")
+app = FastAPI(title="UW Flow Alerts → Telegram (Tier+Zones+Scoring)")
 
 @app.on_event("startup")
 async def startup():
@@ -658,27 +609,26 @@ async def shutdown():
 class TestMessage(BaseModel):
     text: str
 
-class ConfirmReq(BaseModel):
-    ticker: str
-
-@app.get("/")
-def root():
-    return {"ok": True, "hint": "Use /docs or /health"}
-
 @app.get("/health")
 def health():
     return {
         "ok": True,
         "running": state.running,
-        "tickers": TICKERS,
         "poll_seconds": POLL_SECONDS,
         "last_seen_created_at": state.last_seen_created_at,
-        "score_threshold": SCORE_THRESHOLD,
-        "cooldown_minutes": COOLDOWN_MINUTES,
-        "confirm_strict": CONFIRM_STRICT,
-        "orb_minutes": ORB_MINUTES,
-        "confirm_ttl_seconds": CONFIRM_TTL_SECONDS,
+        "tickers_env_filter": TICKERS,
+        "min_premium": MIN_PREMIUM,
+        "min_volume_oi_ratio": MIN_VOLUME_OI_RATIO,
+        "ask_only": ASK_ONLY,
+        "delta_band": [DELTA_MIN, DELTA_MAX],
+        "cooldown_seconds": COOLDOWN_SECONDS,
+        "config_count": len(TICKER_CONFIG),
     }
+
+@app.get("/config")
+def config():
+    # Helpful to verify your table/config loaded correctly
+    return {"tickers": TICKER_CONFIG}
 
 @app.post("/test/telegram")
 async def test_telegram(body: TestMessage):
@@ -710,71 +660,13 @@ async def debug_uw():
     require_env()
     async with httpx.AsyncClient() as client:
         alerts = await fetch_flow_alerts(client)
-    return {"count": len(alerts), "sample": alerts[:2]}
+    sample = alerts[:3]
+    return {"count": len(alerts), "sample": sample}
 
-@app.post("/debug/send_best_now")
-async def send_best_now():
-    require_env()
-    async with httpx.AsyncClient() as client:
-        alerts = await fetch_flow_alerts(client)
-
-        best = None
-        best_score = -1.0
-        best_reasons: List[str] = []
-        best_bias = None
-        best_confirm = None
-        best_confirm_notes: List[str] = []
-
-        for a in alerts:
-            ok, _ = liquidity_gate(a)
-            if not ok:
-                continue
-
-            sc, rs = score_alert(a)
-            bias = infer_bias(a)
-
-            confirm = None
-            confirm_ok = True
-            confirm_notes: List[str] = []
-
-            if bias in ("bull", "bear"):
-                confirm = await get_confirmation_metrics((a.get("ticker") or "").upper(), client)
-                confirm_ok, confirm_notes = confirmation_passes(bias, confirm)
-                if CONFIRM_STRICT and not confirm_ok:
-                    continue
-                if confirm_ok:
-                    sc = min(100, sc + 10)
-                    rs = rs + [f"CONFIRM:{bias.upper()}"]
-                else:
-                    sc = max(0, sc - 10)
-                    rs = rs + [f"NO_CONFIRM:{','.join(confirm_notes[:2])}"]
-
-            if sc > best_score:
-                best_score = sc
-                best = a
-                best_reasons = rs
-                best_bias = bias
-                best_confirm = confirm
-                best_confirm_notes = confirm_notes
-
-        if not best:
-            return {"sent": False, "reason": "No alert passed gates/confirmation"}
-
-        msg = fmt_alert(
-            best,
-            score=best_score,
-            reasons=best_reasons,
-            bias=best_bias if best_bias != "unknown" else None,
-            confirm=best_confirm,
-            confirm_notes=best_confirm_notes if best_confirm_notes else None,
-        )
-        await telegram_send(msg, client)
-        return {"sent": True, "score": best_score, "ticker": best.get("ticker")}
-
-@app.post("/debug/confirm")
-async def debug_confirm(body: ConfirmReq):
-    require_env()
-    ticker = body.ticker.strip().upper()
-    async with httpx.AsyncClient() as client:
-        m = await get_confirmation_metrics(ticker, client)
-    return m
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": "UW Flow Alerts → Telegram (Tier+Zones+Scoring)",
+        "endpoints": ["/docs", "/health", "/config", "/debug/uw", "/test/telegram", "/control/start", "/control/stop", "/control/reset_cursor"],
+    }
