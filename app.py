@@ -615,7 +615,7 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
         f"• Darkpool: {summarize_darkpool(dp)}",
         f"• Time: `{f.get('created_at')}`",
     ]
-   def _gpt_allow_call() -> bool:
+    def _gpt_allow_call() -> bool:
     now = now_utc()
 
     # min spacing
