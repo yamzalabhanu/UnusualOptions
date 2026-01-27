@@ -1,12 +1,17 @@
 """
 app.py — Unusual Whales (Public API) → Telegram
-Upgraded:
-- Bearer auth (Authorization: Bearer <token>)
-- Flow Alerts poller (efficient newer_than cursor)
-- Unusual Chains scanner (volume/OI/vol>OI/prev_oi change)
-- Market Tide context (cached)
-- Darkpool context per ticker (cached)
-- Optional: user custom alerts feed (/api/alerts)
+Upgraded (this update):
+✅ HARD gates (applies to BOTH Flow + Chain alerts):
+   - Volume >= MIN_HARD_VOLUME (default 10000)
+   - OI     >= MIN_HARD_OI     (default 10000)
+✅ Flow alerts additionally require:
+   - Score >= MIN_SCORE_TO_ALERT (default 80)
+✅ Keeps: Bearer auth, newer_than cursor, market tide + darkpool cached,
+   chain unusual triggers (premium/voloi/oi_change) AFTER hard gates.
+
+NOTE:
+- Your previous behavior allowed alerts if ANY trigger hit (premium OR vol/oi OR vol OR oi).
+  Now: hard gates must pass FIRST, then triggers decide.
 """
 
 import os
@@ -48,13 +53,20 @@ MIN_FLOW_VOL_OI_RATIO = float(os.getenv("MIN_FLOW_VOL_OI_RATIO", "1.2"))
 FLOW_ASK_ONLY = os.getenv("FLOW_ASK_ONLY", "1").strip() == "1"  # is_ask_side=true
 FLOW_LIMIT = int(os.getenv("FLOW_LIMIT", "200"))
 
-# Chain scanner thresholds (unusual volume/OI triggers)
-CHAIN_VOL_OI_RATIO = float(os.getenv("CHAIN_VOL_OI_RATIO", "2.0"))         # volume/oi
-CHAIN_MIN_VOLUME = int(os.getenv("CHAIN_MIN_VOLUME", "2500"))
-CHAIN_MIN_OI = int(os.getenv("CHAIN_MIN_OI", "5000"))
-CHAIN_MIN_PREMIUM = float(os.getenv("CHAIN_MIN_PREMIUM", "200000"))        # contract total_premium
-CHAIN_MIN_OI_CHANGE = int(os.getenv("CHAIN_MIN_OI_CHANGE", "1500"))         # abs(oi - prev_oi)
+# Chain scanner thresholds (unusual triggers AFTER hard gates)
+CHAIN_VOL_OI_RATIO = float(os.getenv("CHAIN_VOL_OI_RATIO", "2.0"))          # volume/oi trigger
+CHAIN_MIN_VOLUME = int(os.getenv("CHAIN_MIN_VOLUME", "2500"))               # kept for legacy reporting (not a hard gate)
+CHAIN_MIN_OI = int(os.getenv("CHAIN_MIN_OI", "5000"))                       # kept for legacy reporting (not a hard gate)
+CHAIN_MIN_PREMIUM = float(os.getenv("CHAIN_MIN_PREMIUM", "200000"))         # trigger
+CHAIN_MIN_OI_CHANGE = int(os.getenv("CHAIN_MIN_OI_CHANGE", "1500"))         # trigger: abs(oi - prev_oi)
 CHAIN_VOL_GREATER_OI_ONLY = os.getenv("CHAIN_VOL_GREATER_OI_ONLY", "0") == "1"
+
+# HARD GATES (NEW)
+MIN_HARD_VOLUME = int(os.getenv("MIN_HARD_VOLUME", "10000"))
+MIN_HARD_OI = int(os.getenv("MIN_HARD_OI", "10000"))
+
+# Flow score gate (NEW)
+MIN_SCORE_TO_ALERT = int(os.getenv("MIN_SCORE_TO_ALERT", "80"))
 
 # Telegram dedupe/cooldown
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "600"))
@@ -62,12 +74,10 @@ COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "600"))
 # Optional: enable forwarding user-created alerts (/api/alerts)
 ENABLE_CUSTOM_ALERTS_FEED = os.getenv("ENABLE_CUSTOM_ALERTS_FEED", "0") == "1"
 
-
 DEFAULT_WATCHLIST = [
-    "NVDA","AMD","MSFT","META","AAPL","TSLA","AMZN","GOOGL",
-    "PLTR","CRWD","SMCI","MU","ARM","NFLX","AVGO","COIN","MSTR"
+    "NVDA", "AMD", "MSFT", "META", "AAPL", "TSLA", "AMZN", "GOOGL",
+    "PLTR", "CRWD", "SMCI", "MU", "ARM", "NFLX", "AVGO", "COIN", "MSTR"
 ]
-
 
 # ----------------------------
 # Helpers
@@ -88,7 +98,6 @@ def bearerize(token: str) -> str:
     t = (token or "").strip()
     if not t:
         return ""
-    # If user already put "Bearer xxx", keep it
     if t.lower().startswith("bearer "):
         return t
     return f"Bearer {t}"
@@ -153,14 +162,12 @@ async def telegram_send(text: str, client: httpx.AsyncClient) -> None:
     r = await client.post(url, json=payload, timeout=20)
     r.raise_for_status()
 
-
 # ----------------------------
 # API clients
 # ----------------------------
 async def uw_get(client: httpx.AsyncClient, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     url = f"{UW_BASE_URL}{path}"
     r = await client.get(url, headers=uw_headers(), params=params or {}, timeout=30)
-    # If auth is wrong, raise with payload for quick debugging
     if r.status_code in (401, 403):
         try:
             raise RuntimeError(f"UW auth error {r.status_code}: {r.json()}")
@@ -168,7 +175,6 @@ async def uw_get(client: httpx.AsyncClient, path: str, params: Optional[Dict[str
             raise RuntimeError(f"UW auth error {r.status_code}: {r.text}")
     r.raise_for_status()
     return r.json()
-
 
 # ----------------------------
 # State
@@ -196,7 +202,7 @@ class State:
     market_tide_cache: Optional[CacheItem] = None
     darkpool_cache: Dict[str, CacheItem] = field(default_factory=dict)
 
-    # Chain scanner dedupe: last seen per ticker+contract (so you don’t spam same chain every minute)
+    # Chain scanner dedupe: last seen per ticker+contract
     chain_seen: Dict[str, datetime] = field(default_factory=dict)
 
 
@@ -210,12 +216,10 @@ def cooldown_ok(key: str) -> bool:
         return False
     state.cooldown[key] = now
 
-    # prune
     if len(state.cooldown) > 5000:
         cutoff = now - timedelta(seconds=COOLDOWN_SECONDS * 3)
         state.cooldown = {k: v for k, v in state.cooldown.items() if v >= cutoff}
     return True
-
 
 # ----------------------------
 # Market Tide (cached)
@@ -234,14 +238,9 @@ async def get_market_tide(client: httpx.AsyncClient) -> Optional[Dict[str, Any]]
 
 
 def summarize_market_tide(tide_json: Any) -> str:
-    """
-    Tide payload is a time series; we’ll just pick last point if possible.
-    We keep it defensive because UW may change fields.
-    """
     try:
         if isinstance(tide_json, dict) and "data" in tide_json and isinstance(tide_json["data"], list) and tide_json["data"]:
             last = tide_json["data"][-1]
-            # common-ish fields (defensive)
             call = safe_float(last.get("net_call_premium"))
             put = safe_float(last.get("net_put_premium"))
             net = safe_float(last.get("net_premium"))
@@ -260,7 +259,6 @@ def summarize_market_tide(tide_json: Any) -> str:
         pass
     return "n/a"
 
-
 # ----------------------------
 # Darkpool (cached per ticker)
 # ----------------------------
@@ -271,7 +269,6 @@ async def get_darkpool_for_ticker(client: httpx.AsyncClient, ticker: str) -> Opt
         return ci.value
 
     try:
-        # Recent darkpool trades for ticker; keep it light
         data = await uw_get(client, f"/api/darkpool/{ticker}", params={"limit": 25})
         state.darkpool_cache[ticker] = CacheItem(value=data, expires_at=now + timedelta(seconds=DARKPOOL_CACHE_SECONDS))
         return data
@@ -281,11 +278,9 @@ async def get_darkpool_for_ticker(client: httpx.AsyncClient, ticker: str) -> Opt
 
 def summarize_darkpool(dp_json: Any) -> str:
     try:
-        # Many UW endpoints return dict with "data"
         rows = dp_json.get("data") if isinstance(dp_json, dict) else dp_json
         if not isinstance(rows, list) or not rows:
             return "n/a"
-        # best guess fields
         top = rows[0]
         prem = safe_float(top.get("premium") or top.get("total_premium") or top.get("notional"))
         price = safe_float(top.get("price"))
@@ -304,12 +299,10 @@ def summarize_darkpool(dp_json: Any) -> str:
     except Exception:
         return "n/a"
 
-
 # ----------------------------
 # Flow Alerts poller
 # ----------------------------
 def get_flow_fields(a: Dict[str, Any]) -> Dict[str, Any]:
-    # Defensive mapping (UW can vary a bit)
     return {
         "ticker": str(a.get("ticker_symbol") or a.get("ticker") or a.get("symbol") or "UNK").upper(),
         "opt_type": "CALL" if bool(a.get("is_call")) else ("PUT" if bool(a.get("is_put")) else str(a.get("type") or "").upper()),
@@ -329,9 +322,6 @@ def get_flow_fields(a: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def score_flow_alert(f: Dict[str, Any]) -> int:
-    """
-    Simple score: premium + vol/oi + ask-side + delta sweetspot.
-    """
     score = 50
 
     prem = f.get("premium") or 0.0
@@ -373,14 +363,10 @@ async def fetch_flow_alerts(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     }
     if FLOW_ASK_ONLY:
         params["is_ask_side"] = "true"
-    # Use cursor for efficiency (API supports newer_than)
     if state.flow_newer_than:
         params["newer_than"] = state.flow_newer_than
 
-    # If you want server-side ticker filter:
     tickers = WATCHLIST or DEFAULT_WATCHLIST
-    # The OpenAPI shows `ticker_symbol` for flow-alerts filtering
-    # (kept defensive: if UW accepts only one ticker at a time, it will just ignore)
     params["ticker_symbol"] = ",".join(tickers)
 
     data = await uw_get(client, "/api/option-trades/flow-alerts", params=params)
@@ -389,47 +375,55 @@ async def fetch_flow_alerts(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
 
 
 def flow_alert_key(f: Dict[str, Any]) -> str:
-    # stable-ish dedupe key
     raw = "|".join([
-        f.get("ticker",""),
-        str(f.get("opt_type","")),
-        str(f.get("strike","")),
-        str(f.get("expiry","")),
-        str(f.get("premium","")),
-        str(f.get("created_at","")),
-        str(f.get("contract","")),
+        f.get("ticker", ""),
+        str(f.get("opt_type", "")),
+        str(f.get("strike", "")),
+        str(f.get("expiry", "")),
+        str(f.get("premium", "")),
+        str(f.get("created_at", "")),
+        str(f.get("contract", "")),
     ])
     return sha16(raw)
 
 
 async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> None:
     f = get_flow_fields(a)
-    ticker = f["ticker"]
+
+    # HARD GATES (NEW) — do this BEFORE cooldown so rejects don't consume cooldown
+    vol = f.get("volume") or 0
+    oi = f.get("oi") or 0
+    if vol < MIN_HARD_VOLUME:
+        return
+    if oi < MIN_HARD_OI:
+        return
+
+    score = score_flow_alert(f)
+    if score < MIN_SCORE_TO_ALERT:
+        return
+
     key = "flow:" + flow_alert_key(f)
     if not cooldown_ok(key):
         return
 
+    ticker = f["ticker"]
     tide = await get_market_tide(client)
     dp = await get_darkpool_for_ticker(client, ticker)
-
-    score = score_flow_alert(f)
 
     lines = [
         f"🚨 *UW Flow Alert* — *{ticker}* | *Score:* `{score}/100`",
         f"• Type/Side: `{f.get('opt_type')}` / `{str(f.get('side') or 'n/a')}` | Rule: `{f.get('rule')}`",
         f"• Contract: `{f.get('contract') or 'n/a'}`",
         f"• Premium: *{money(f.get('premium'))}* | Vol/OI: `{f.get('vol_oi')}` | Δ: `{f.get('delta')}`",
-        f"• Vol: `{f.get('volume')}` | OI: `{f.get('oi')}` | Underlying: `{f.get('underlying')}`",
+        f"• Vol: `{vol}` | OI: `{oi}` | Underlying: `{f.get('underlying')}`",
         f"• MarketTide: {summarize_market_tide(tide)}",
         f"• Darkpool: {summarize_darkpool(dp)}",
         f"• Time: `{f.get('created_at')}`",
     ]
     await telegram_send("\n".join(lines), client)
 
-    # advance cursor
     if f.get("created_at"):
         state.flow_newer_than = f["created_at"]
-
 
 # ----------------------------
 # Unusual Chains scanner
@@ -453,33 +447,51 @@ def chain_row_fields(r: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def chain_is_unusual(f: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    reasons = []
+    """
+    NEW behavior:
+    1) HARD gate: vol>=MIN_HARD_VOLUME AND oi>=MIN_HARD_OI
+    2) THEN require at least one "unusual trigger" (premium, vol/oi, oi_change, etc.)
+    """
     vol = f.get("volume") or 0
     oi = f.get("open_interest") or 0
     prev_oi = f.get("prev_oi")
     prem = f.get("total_premium") or 0.0
 
+    # HARD GATES (NEW)
+    if vol < MIN_HARD_VOLUME:
+        return False, [f"hard_vol<{MIN_HARD_VOLUME}"]
+    if oi < MIN_HARD_OI:
+        return False, [f"hard_oi<{MIN_HARD_OI}"]
+
     voloi = (vol / oi) if oi > 0 else None
     oi_chg = (oi - prev_oi) if (prev_oi is not None) else None
 
-    if vol >= CHAIN_MIN_VOLUME:
-        reasons.append(f"vol>={CHAIN_MIN_VOLUME}")
-    if oi >= CHAIN_MIN_OI:
-        reasons.append(f"oi>={CHAIN_MIN_OI}")
+    # Optional vol>oi-only constraint
+    if CHAIN_VOL_GREATER_OI_ONLY and not (oi > 0 and vol > oi):
+        return False, ["need_vol>oi"]
+
+    reasons: List[str] = []
+
+    # Triggers AFTER hard gates
     if prem >= CHAIN_MIN_PREMIUM:
         reasons.append(f"prem>={int(CHAIN_MIN_PREMIUM)}")
     if voloi is not None and voloi >= CHAIN_VOL_OI_RATIO:
         reasons.append(f"vol/oi>={CHAIN_VOL_OI_RATIO:g}")
-    if CHAIN_VOL_GREATER_OI_ONLY and not (oi > 0 and vol > oi):
-        return False, ["need_vol>oi"]
     if oi_chg is not None and abs(oi_chg) >= CHAIN_MIN_OI_CHANGE:
         reasons.append(f"oi_chg>={CHAIN_MIN_OI_CHANGE}")
 
-    return (len(reasons) > 0), reasons
+    # Keep legacy triggers as informational only (not needed for pass)
+    if vol >= CHAIN_MIN_VOLUME:
+        reasons.append(f"vol>={CHAIN_MIN_VOLUME}")
+    if oi >= CHAIN_MIN_OI:
+        reasons.append(f"oi>={CHAIN_MIN_OI}")
+
+    # Must have at least one "real" trigger: premium or vol/oi or oi_chg
+    real_triggers = [r for r in reasons if r.startswith("prem>=") or r.startswith("vol/oi>=") or r.startswith("oi_chg>=")]
+    return (len(real_triggers) > 0), reasons
 
 
 async def fetch_option_contracts(client: httpx.AsyncClient, ticker: str) -> List[Dict[str, Any]]:
-    # This endpoint returns up to 500 rows; use filters to reduce noise
     params: Dict[str, Any] = {
         "limit": 500,
         "exclude_zero_vol_chains": "true",
@@ -499,7 +511,6 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
     except Exception:
         return
 
-    # rank by premium then volume (best effort)
     scored: List[Tuple[float, Dict[str, Any], List[str]]] = []
     for r in rows:
         f = chain_row_fields(r)
@@ -513,28 +524,28 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         return
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    top = scored[:3]  # send top 3 per scan tick
+    top = scored[:3]
 
     tide = await get_market_tide(client)
     dp = await get_darkpool_for_ticker(client, ticker)
 
     for prem, f, reasons in top:
-        # ticker+contract dedupe (separate from global cooldown)
         unique = f"chain:{ticker}:{f.get('option_symbol')}"
         last = state.chain_seen.get(unique)
         if last and (now_utc() - last).total_seconds() < COOLDOWN_SECONDS:
             continue
         state.chain_seen[unique] = now_utc()
 
-        key = "chain:" + sha16(unique + ":" + json.dumps(reasons))
+        # cooldown key includes triggers but NOT raw payload
+        key = "chain:" + sha16(unique + ":" + "|".join(reasons))
         if not cooldown_ok(key):
             continue
 
-        vol = f.get("volume")
-        oi = f.get("open_interest")
+        vol = f.get("volume") or 0
+        oi = f.get("open_interest") or 0
         prev_oi = f.get("prev_oi")
-        voloi = (vol / oi) if (vol is not None and oi and oi > 0) else None
-        oi_chg = (oi - prev_oi) if (oi is not None and prev_oi is not None) else None
+        voloi = (vol / oi) if (oi > 0) else None
+        oi_chg = (oi - prev_oi) if (prev_oi is not None) else None
 
         lines = [
             f"🔥 *UW Unusual Chain* — *{ticker}*",
@@ -548,7 +559,6 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
             f"• Time: `{now_utc().isoformat()}`",
         ]
         await telegram_send("\n".join(lines), client)
-
 
 # ----------------------------
 # Optional: Custom Alerts feed (/api/alerts)
@@ -595,7 +605,6 @@ async def handle_custom_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> N
     if ts:
         state.alerts_newer_than = ts
 
-
 # ----------------------------
 # Background loops
 # ----------------------------
@@ -604,11 +613,11 @@ async def flow_loop():
         while state.running:
             try:
                 rows = await fetch_flow_alerts(client)
-                # process oldest->newest so cursor advances correctly
+
                 def _k(x: Dict[str, Any]) -> datetime:
                     return parse_iso(str(x.get("created_at") or "1970-01-01T00:00:00+00:00"))
-                rows_sorted = sorted(rows, key=_k)
-                for a in rows_sorted:
+
+                for a in sorted(rows, key=_k):
                     await handle_flow_alert(client, a)
             except Exception:
                 pass
@@ -620,7 +629,6 @@ async def chains_loop():
         while state.running:
             tickers = WATCHLIST or DEFAULT_WATCHLIST
             try:
-                # scan sequentially (safe for rate limits). If you want, parallelize with a semaphore.
                 for t in tickers:
                     await scan_unusual_chains_for_ticker(client, t)
             except Exception:
@@ -633,14 +641,15 @@ async def custom_alerts_loop():
         while state.running:
             try:
                 rows = await fetch_custom_alerts(client)
+
                 def _k(x: Dict[str, Any]) -> datetime:
                     return parse_iso(str(x.get("tape_time") or x.get("created_at") or "1970-01-01T00:00:00+00:00"))
+
                 for a in sorted(rows, key=_k):
                     await handle_custom_alert(client, a)
             except Exception:
                 pass
             await asyncio.sleep(ALERTS_POLL_SECONDS)
-
 
 # ----------------------------
 # FastAPI app
@@ -668,24 +677,28 @@ def health():
         "running": state.running,
         "base_url": UW_BASE_URL,
         "watchlist_count": len(WATCHLIST or DEFAULT_WATCHLIST),
+        "hard_gates": {
+            "min_hard_volume": MIN_HARD_VOLUME,
+            "min_hard_oi": MIN_HARD_OI,
+            "min_score_to_alert": MIN_SCORE_TO_ALERT,
+        },
         "flow": {
             "poll_seconds": FLOW_POLL_SECONDS,
             "min_premium": MIN_FLOW_PREMIUM,
             "min_vol_oi_ratio": MIN_FLOW_VOL_OI_RATIO,
             "ask_only": FLOW_ASK_ONLY,
+            "limit": FLOW_LIMIT,
             "cursor_newer_than": state.flow_newer_than,
         },
         "chains": {
             "poll_seconds": CHAIN_POLL_SECONDS,
-            "min_volume": CHAIN_MIN_VOLUME,
-            "min_oi": CHAIN_MIN_OI,
-            "min_premium": CHAIN_MIN_PREMIUM,
-            "min_oi_change": CHAIN_MIN_OI_CHANGE,
-            "vol_oi_ratio": CHAIN_VOL_OI_RATIO,
+            "trigger_premium": CHAIN_MIN_PREMIUM,
+            "trigger_min_oi_change": CHAIN_MIN_OI_CHANGE,
+            "trigger_vol_oi_ratio": CHAIN_VOL_OI_RATIO,
             "vol_greater_oi_only": CHAIN_VOL_GREATER_OI_ONLY,
         },
-        "custom_alerts_feed_enabled": ENABLE_CUSTOM_ALERTS_FEED,
         "cooldown_seconds": COOLDOWN_SECONDS,
+        "custom_alerts_feed_enabled": ENABLE_CUSTOM_ALERTS_FEED,
     }
 
 
