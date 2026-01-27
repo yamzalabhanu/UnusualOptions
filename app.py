@@ -600,6 +600,25 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
     key = "flow:" + flow_alert_key(f)
     if not cooldown_ok(key):
         return
+def _gpt_allow_call() -> bool:
+    now = now_utc()
+
+    # minimum spacing between GPT calls
+    if state.gpt_last_call_at is not None:
+        if (now - state.gpt_last_call_at).total_seconds() < GPT_MIN_SECONDS_BETWEEN_CALLS:
+            return False
+
+    # rolling 60s window
+    if state.gpt_window_start is None or (now - state.gpt_window_start).total_seconds() >= 60:
+        state.gpt_window_start = now
+        state.gpt_calls_in_window = 0
+
+    if state.gpt_calls_in_window >= GPT_MAX_CALLS_PER_MINUTE:
+        return False
+
+    state.gpt_last_call_at = now
+    state.gpt_calls_in_window += 1
+    return True
 
     ticker = f["ticker"]
     tide = await get_market_tide(client)
@@ -615,25 +634,6 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
         f"• Darkpool: {summarize_darkpool(dp)}",
         f"• Time: `{f.get('created_at')}`",
     ]
-    def _gpt_allow_call() -> bool:
-    now = now_utc()
-
-    # min spacing
-    if state.gpt_last_call_at is not None:
-        if (now - state.gpt_last_call_at).total_seconds() < GPT_MIN_SECONDS_BETWEEN_CALLS:
-            return False
-
-    # per-minute window
-    if state.gpt_window_start is None or (now - state.gpt_window_start).total_seconds() >= 60:
-        state.gpt_window_start = now
-        state.gpt_calls_in_window = 0
-
-    if state.gpt_calls_in_window >= GPT_MAX_CALLS_PER_MINUTE:
-        return False
-
-    state.gpt_last_call_at = now
-    state.gpt_calls_in_window += 1
-    return True
    
     await send_via_gpt_formatter("\n".join(lines), client)
 
