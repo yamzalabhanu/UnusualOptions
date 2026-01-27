@@ -154,14 +154,17 @@ def require_env():
 
 def uw_headers() -> Dict[str, str]:
     if not UW_TOKEN:
-        return {"Accept": "application/json, text/plain"}
+        raise RuntimeError("UW_TOKEN is empty")
+
     token = UW_TOKEN.strip()
     if token.lower().startswith("bearer "):
         token = token.split(" ", 1)[1].strip()
+
     return {
-        "Accept": "application/json, text/plain",
         "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
     }
+}
 
 
 def h(x: Any) -> str:
