@@ -600,6 +600,10 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
     key = "flow:" + flow_alert_key(f)
     if not cooldown_ok(key):
         return
+    ticker = f["ticker"]
+    tide = await get_market_tide(client)
+    dp = await get_darkpool_for_ticker(client, ticker)
+   
 def _gpt_allow_call() -> bool:
     now = now_utc()
 
@@ -619,10 +623,6 @@ def _gpt_allow_call() -> bool:
     state.gpt_last_call_at = now
     state.gpt_calls_in_window += 1
     return True
-
-    ticker = f["ticker"]
-    tide = await get_market_tide(client)
-    dp = await get_darkpool_for_ticker(client, ticker)
 
     lines = [
         f"🚨 *UW Flow Alert* — *{ticker}* | *Score:* `{score}/100`",
