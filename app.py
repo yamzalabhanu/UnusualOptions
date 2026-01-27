@@ -91,6 +91,20 @@ GPT_FORMATTER_URL = os.getenv("GPT_FORMATTER_URL", "").strip()
 GPT_FORMATTER_TIMEOUT = int(os.getenv("GPT_FORMATTER_TIMEOUT", "20"))
 GPT_FORMATTER_FALLBACK_DIRECT = os.getenv("GPT_FORMATTER_FALLBACK_DIRECT", "0").strip() == "1"
 
+# GPT throttling (NEW) — prevents OpenAI 429 spam
+GPT_MIN_SECONDS_BETWEEN_CALLS = float(os.getenv("GPT_MIN_SECONDS_BETWEEN_CALLS", "2.0"))
+GPT_MAX_CALLS_PER_MINUTE = int(os.getenv("GPT_MAX_CALLS_PER_MINUTE", "20"))
+
+# If throttled, what to do:
+# 1 = drop alert (recommended), 0 = fallback to raw telegram (can still be noisy)
+GPT_DROP_WHEN_THROTTLED = os.getenv("GPT_DROP_WHEN_THROTTLED", "1") == "1"
+
+# Optional: only GPT-format chain alerts when they are "strong"
+GPT_CHAIN_MIN_PREMIUM = float(os.getenv("GPT_CHAIN_MIN_PREMIUM", "1000000"))
+GPT_CHAIN_MIN_VOLOI = float(os.getenv("GPT_CHAIN_MIN_VOLOI", "3.0"))
+GPT_CHAIN_MIN_OI_CHANGE = int(os.getenv("GPT_CHAIN_MIN_OI_CHANGE", "5000"))
+
+
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 log = logging.getLogger("uw_app")
 
@@ -312,10 +326,15 @@ def _local_formatter_url() -> str:
     return f"http://127.0.0.1:{port}/format-and-send"
 
 async def send_via_gpt_formatter(raw_text: str, client: httpx.AsyncClient) -> None:
-    """
-    Forwards raw text to local formatter endpoint in THIS SAME service.
-    That endpoint does GPT formatting + Telegram send.
-    """
+    # Throttle GPT calls to avoid 429
+    if not _gpt_allow_call():
+        if GPT_DROP_WHEN_THROTTLED:
+            log.info("GPT throttled: dropping alert")
+            return
+        # fallback: send raw (can still be noisy)
+        await telegram_send(raw_text, client)
+        return
+
     url = GPT_FORMATTER_URL or _local_formatter_url()
 
     try:
@@ -331,6 +350,7 @@ async def send_via_gpt_formatter(raw_text: str, client: httpx.AsyncClient) -> No
         if GPT_FORMATTER_FALLBACK_DIRECT:
             await telegram_send(raw_text, client)
         return
+
 
 # ----------------------------
 # API clients
@@ -374,6 +394,11 @@ class State:
 
     # Chain scanner dedupe: last seen per ticker+contract
     chain_seen: Dict[str, datetime] = field(default_factory=dict)
+    # GPT rate limit state
+    gpt_last_call_at: Optional[datetime] = None
+    gpt_window_start: Optional[datetime] = None
+    gpt_calls_in_window: int = 0
+
 
 
 state = State()
@@ -590,6 +615,25 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
         f"• Darkpool: {summarize_darkpool(dp)}",
         f"• Time: `{f.get('created_at')}`",
     ]
+   def _gpt_allow_call() -> bool:
+    now = now_utc()
+
+    # min spacing
+    if state.gpt_last_call_at is not None:
+        if (now - state.gpt_last_call_at).total_seconds() < GPT_MIN_SECONDS_BETWEEN_CALLS:
+            return False
+
+    # per-minute window
+    if state.gpt_window_start is None or (now - state.gpt_window_start).total_seconds() >= 60:
+        state.gpt_window_start = now
+        state.gpt_calls_in_window = 0
+
+    if state.gpt_calls_in_window >= GPT_MAX_CALLS_PER_MINUTE:
+        return False
+
+    state.gpt_last_call_at = now
+    state.gpt_calls_in_window += 1
+    return True
    
     await send_via_gpt_formatter("\n".join(lines), client)
 
@@ -729,6 +773,23 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
             f"• Darkpool: {summarize_darkpool(dp)}",
             f"• Time: `{now_utc().isoformat()}`",
         ]
+        # Optional: only spend GPT on strong chains
+        vol = f.get("volume") or 0
+        oi = f.get("open_interest") or 0
+        prev_oi = f.get("prev_oi")
+        voloi = (vol / oi) if (oi > 0) else None
+        oi_chg = (oi - prev_oi) if (prev_oi is not None) else None
+        prem_val = f.get("total_premium") or 0.0
+
+        strong = (
+            (prem_val >= GPT_CHAIN_MIN_PREMIUM) or
+            (voloi is not None and voloi >= GPT_CHAIN_MIN_VOLOI) or
+            (oi_chg is not None and abs(oi_chg) >= GPT_CHAIN_MIN_OI_CHANGE)
+        )
+        if not strong:
+            log.info("Chain alert not strong enough for GPT; skipping")
+            continue
+
    
         await send_via_gpt_formatter("\n".join(lines), client)
 
