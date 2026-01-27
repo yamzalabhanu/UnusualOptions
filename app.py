@@ -460,7 +460,7 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
         f"• Time: `{f.get('created_at')}`",
     ]
    
-await send_via_gpt_formatter("\n".join(lines), client)
+    await send_via_gpt_formatter("\n".join(lines), client)
 
     if f.get("created_at"):
         state.flow_newer_than = f["created_at"]
