@@ -70,7 +70,7 @@ MIN_HARD_VOLUME = int(os.getenv("MIN_HARD_VOLUME", "10000"))
 MIN_HARD_OI = int(os.getenv("MIN_HARD_OI", "10000"))
 
 # Flow score gate (NEW)
-MIN_SCORE_TO_ALERT = int(os.getenv("MIN_SCORE_TO_ALERT", "80"))
+MIN_SCORE_TO_ALERT = int(os.getenv("MIN_SCORE_TO_ALERT", "70"))
 
 # Telegram dedupe/cooldown
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "600"))
