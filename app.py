@@ -185,7 +185,7 @@ async def telegram_send(text: str, client: httpx.AsyncClient) -> None:
     }
     r = await client.post(url, json=payload, timeout=20)
     r.raise_for_status()
-   def require_openai_env() -> None:
+    def require_openai_env() -> None:
     if not OPENAI_API_KEY:
         raise RuntimeError("Missing env var: OPENAI_API_KEY")
 
