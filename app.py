@@ -17,6 +17,7 @@ NOTE:
 import os
 import asyncio
 import hashlib
+import logging
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
@@ -73,6 +74,16 @@ COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "600"))
 
 # Optional: enable forwarding user-created alerts (/api/alerts)
 ENABLE_CUSTOM_ALERTS_FEED = os.getenv("ENABLE_CUSTOM_ALERTS_FEED", "0") == "1"
+
+# ----------------------------
+# GPT Formatter forwarding
+# ----------------------------
+GPT_FORMATTER_URL = os.getenv("GPT_FORMATTER_URL", "").strip()
+GPT_FORMATTER_TIMEOUT = int(os.getenv("GPT_FORMATTER_TIMEOUT", "20"))
+GPT_FORMATTER_FALLBACK_DIRECT = os.getenv("GPT_FORMATTER_FALLBACK_DIRECT", "0").strip() == "1"
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+log = logging.getLogger("uw_app")
 
 DEFAULT_WATCHLIST = [
     "NVDA", "AMD", "MSFT", "META", "AAPL", "TSLA", "AMZN", "GOOGL",
@@ -161,6 +172,34 @@ async def telegram_send(text: str, client: httpx.AsyncClient) -> None:
     }
     r = await client.post(url, json=payload, timeout=20)
     r.raise_for_status()
+   
+async def send_via_gpt_formatter(raw_text: str, client: httpx.AsyncClient) -> None:
+    """
+    Forwards raw alert text to GPT formatter service which will:
+      1) rewrite it into user-readable format using OpenAI
+      2) send it to Telegram
+    If GPT_FORMATTER_URL is not set, falls back to direct telegram_send(raw_text).
+    """
+    if not GPT_FORMATTER_URL:
+        # If you didn't set the service URL, keep original behavior
+        await telegram_send(raw_text, client)
+        return
+
+    try:
+        r = await client.post(
+            GPT_FORMATTER_URL,
+            json={"raw_text": raw_text, "send_to_telegram": True},
+            timeout=GPT_FORMATTER_TIMEOUT,
+        )
+        r.raise_for_status()
+        # Formatter already sends to Telegram; nothing else to do.
+        return
+    except Exception as e:
+        log.warning("GPT formatter failed: %s", repr(e))
+        if GPT_FORMATTER_FALLBACK_DIRECT:
+            await telegram_send(raw_text, client)
+        # else: drop the message (so Telegram stays GPT-only)
+        return
 
 # ----------------------------
 # API clients
@@ -420,7 +459,8 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
         f"• Darkpool: {summarize_darkpool(dp)}",
         f"• Time: `{f.get('created_at')}`",
     ]
-    await telegram_send("\n".join(lines), client)
+   
+await send_via_gpt_formatter("\n".join(lines), client)
 
     if f.get("created_at"):
         state.flow_newer_than = f["created_at"]
@@ -558,7 +598,9 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
             f"• Darkpool: {summarize_darkpool(dp)}",
             f"• Time: `{now_utc().isoformat()}`",
         ]
-        await telegram_send("\n".join(lines), client)
+   
+       await send_via_gpt_formatter("\n".join(lines), client)
+
 
 # ----------------------------
 # Optional: Custom Alerts feed (/api/alerts)
@@ -744,7 +786,7 @@ class TestMessage(BaseModel):
 async def test_telegram(body: TestMessage):
     require_env()
     async with httpx.AsyncClient() as client:
-        await telegram_send(body.text, client)
+        await send_via_gpt_formatter(body.text, client)
     return {"sent": True}
 
 
