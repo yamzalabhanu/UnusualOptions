@@ -164,7 +164,7 @@ def uw_headers() -> Dict[str, str]:
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
     }
-}
+
 
 
 def h(x: Any) -> str:
