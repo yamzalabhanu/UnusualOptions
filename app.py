@@ -26,6 +26,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
+import re
+import logging
+from openai import OpenAI
+
 
 # ----------------------------
 # ENV / CONFIG
@@ -76,14 +80,23 @@ COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "600"))
 ENABLE_CUSTOM_ALERTS_FEED = os.getenv("ENABLE_CUSTOM_ALERTS_FEED", "0") == "1"
 
 # ----------------------------
-# GPT Formatter forwarding
+# OpenAI GPT formatter (NEW)
 # ----------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5").strip()
+OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "low").strip()
+OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "350"))
+
+# If empty, we will auto-call local endpoint http://127.0.0.1:<PORT>/format-and-send
 GPT_FORMATTER_URL = os.getenv("GPT_FORMATTER_URL", "").strip()
 GPT_FORMATTER_TIMEOUT = int(os.getenv("GPT_FORMATTER_TIMEOUT", "20"))
 GPT_FORMATTER_FALLBACK_DIRECT = os.getenv("GPT_FORMATTER_FALLBACK_DIRECT", "0").strip() == "1"
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 log = logging.getLogger("uw_app")
+
+_openai_client: Optional[OpenAI] = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
 
 DEFAULT_WATCHLIST = [
     "NVDA", "AMD", "MSFT", "META", "AAPL", "TSLA", "AMZN", "GOOGL",
@@ -172,34 +185,79 @@ async def telegram_send(text: str, client: httpx.AsyncClient) -> None:
     }
     r = await client.post(url, json=payload, timeout=20)
     r.raise_for_status()
-   
+   def require_openai_env() -> None:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Missing env var: OPENAI_API_KEY")
+
+def sanitize_for_prompt(text: str) -> str:
+    text = (text or "").strip()
+    text = re.sub(r"\n{4,}", "\n\n", text)
+    return text[:12000]
+
+def strip_markdown_risky(text: str) -> str:
+    if not text:
+        return text
+    # avoid triple backticks which can break Telegram Markdown
+    return text.replace("```", "`")
+
+def formatter_instructions() -> str:
+    return (
+        "Rewrite stock/options alerts into a user-readable, accurate, actionable summary.\n"
+        "Rules:\n"
+        "- ONLY use facts present in the input alert text. Do NOT invent numbers, news, levels, targets, or catalysts.\n"
+        "- If a field is missing (e.g., delta), say 'unknown' (do not guess).\n"
+        "- Keep it short: 6–12 lines.\n"
+        "- Use Telegram-friendly Markdown. No code blocks.\n"
+        "- Highlight: ticker, alert type (Flow/Chain), direction (CALL/PUT), contract, premium, vol, OI, vol/OI, score, side, rule.\n"
+        "- Include a 'Risk notes' section with max 2 bullets.\n"
+    )
+
+async def gpt_rewrite_alert(raw_text: str) -> str:
+    require_openai_env()
+    if _openai_client is None:
+        raise RuntimeError("OpenAI client not initialized")
+
+    resp = _openai_client.responses.create(
+        model=OPENAI_MODEL,
+        reasoning={"effort": OPENAI_REASONING_EFFORT},
+        instructions=formatter_instructions(),
+        input=f"Rewrite this alert:\n\n{sanitize_for_prompt(raw_text)}",
+        max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+    )
+
+    # SDK commonly provides output_text
+    out = getattr(resp, "output_text", "") or ""
+    out = out.strip()
+    out = strip_markdown_risky(out)
+
+    # Optional header
+    return "🧠 *GPT Summary*\n" + out if out else raw_text
+
+def _local_formatter_url() -> str:
+    port = os.getenv("PORT", "8000")
+    return f"http://127.0.0.1:{port}/format-and-send"
+
 async def send_via_gpt_formatter(raw_text: str, client: httpx.AsyncClient) -> None:
     """
-    Forwards raw alert text to GPT formatter service which will:
-      1) rewrite it into user-readable format using OpenAI
-      2) send it to Telegram
-    If GPT_FORMATTER_URL is not set, falls back to direct telegram_send(raw_text).
+    Forwards raw text to local formatter endpoint in THIS SAME service.
+    That endpoint does GPT formatting + Telegram send.
     """
-    if not GPT_FORMATTER_URL:
-        # If you didn't set the service URL, keep original behavior
-        await telegram_send(raw_text, client)
-        return
+    url = GPT_FORMATTER_URL or _local_formatter_url()
 
     try:
         r = await client.post(
-            GPT_FORMATTER_URL,
+            url,
             json={"raw_text": raw_text, "send_to_telegram": True},
             timeout=GPT_FORMATTER_TIMEOUT,
         )
         r.raise_for_status()
-        # Formatter already sends to Telegram; nothing else to do.
         return
     except Exception as e:
         log.warning("GPT formatter failed: %s", repr(e))
         if GPT_FORMATTER_FALLBACK_DIRECT:
             await telegram_send(raw_text, client)
-        # else: drop the message (so Telegram stays GPT-only)
         return
+return
 
 # ----------------------------
 # API clients
@@ -814,6 +872,33 @@ def reset_cursors():
     state.alerts_newer_than = None
     return {"flow_newer_than": None, "alerts_newer_than": None}
 
+class InboundAlert(BaseModel):
+    raw_text: str
+    send_to_telegram: bool = True
+
+@app.post("/format")
+async def format_only(body: InboundAlert):
+    """
+    Returns GPT-formatted message; optionally sends to Telegram.
+    """
+    require_env()
+    formatted = await gpt_rewrite_alert(body.raw_text)
+    if body.send_to_telegram:
+        async with httpx.AsyncClient() as client:
+            await telegram_send(formatted, client)
+    return {"formatted": formatted, "sent": body.send_to_telegram}
+
+@app.post("/format-and-send")
+async def format_and_send(body: InboundAlert):
+    """
+    Always formats and (by default) sends to Telegram.
+    """
+    require_env()
+    formatted = await gpt_rewrite_alert(body.raw_text)
+    if body.send_to_telegram:
+        async with httpx.AsyncClient() as client:
+            await telegram_send(formatted, client)
+    return {"ok": True, "sent": body.send_to_telegram}
 
 @app.get("/")
 def root():
