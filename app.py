@@ -28,6 +28,9 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import re
 from openai import OpenAI
+import time
+from collections import OrderedDict
+
 
 
 # ----------------------------
@@ -77,6 +80,12 @@ COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "600"))
 
 # Optional: enable forwarding user-created alerts (/api/alerts)
 ENABLE_CUSTOM_ALERTS_FEED = os.getenv("ENABLE_CUSTOM_ALERTS_FEED", "0") == "1"
+
+# Dedupe tuning
+DEDUP_TTL_SECONDS = int(os.getenv("DEDUP_TTL_SECONDS", "1800"))           # 30 min
+DEDUP_MAX_KEYS = int(os.getenv("DEDUP_MAX_KEYS", "20000"))
+CROSS_STREAM_SUPPRESS_SECONDS = int(os.getenv("CROSS_STREAM_SUPPRESS_SECONDS", "1800"))
+
 
 # ----------------------------
 # OpenAI GPT formatter (NEW)
@@ -188,6 +197,72 @@ def money(x: Optional[float]) -> str:
 def sha16(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
+def _prune_ordered_cache(cache: "OrderedDict[str, float]", ttl: int, max_keys: int) -> None:
+    now = time.time()
+
+    # prune by ttl
+    while cache:
+        k, ts = next(iter(cache.items()))
+        if (now - ts) <= ttl:
+            break
+        cache.popitem(last=False)
+
+    # prune by size
+    while len(cache) > max_keys:
+        cache.popitem(last=False)
+
+
+def _mark_seen(cache: "OrderedDict[str, float]", key: str) -> None:
+    now = time.time()
+    cache[key] = now
+    cache.move_to_end(key, last=True)
+
+
+def _seen_recently(cache: "OrderedDict[str, float]", key: str, ttl: int) -> bool:
+    now = time.time()
+    ts = cache.get(key)
+    if ts is None:
+        return False
+    return (now - ts) <= ttl
+
+
+def normalize_contract(contract: str) -> str:
+    return (contract or "").strip().upper()
+
+
+def stable_fingerprint(parts: List[str]) -> str:
+    # normalize tiny differences to reduce “same alert” duplicates
+    norm = []
+    for p in parts:
+        s = (p or "").strip().upper()
+        s = " ".join(s.split())  # collapse whitespace
+        norm.append(s)
+    return sha16("|".join(norm))
+
+
+def dedupe_event(key: str) -> bool:
+    """
+    Returns True if we should SEND; False if duplicate.
+    """
+    _prune_ordered_cache(state.sent_cache, DEDUP_TTL_SECONDS, DEDUP_MAX_KEYS)
+    if _seen_recently(state.sent_cache, key, DEDUP_TTL_SECONDS):
+        return False
+    _mark_seen(state.sent_cache, key)
+    return True
+
+
+def suppress_contract(contract: str) -> bool:
+    """
+    Returns True if allowed; False if contract was already alerted recently (cross-stream).
+    """
+    c = normalize_contract(contract)
+    if not c:
+        return True
+    _prune_ordered_cache(state.sent_contract_cache, CROSS_STREAM_SUPPRESS_SECONDS, DEDUP_MAX_KEYS)
+    if _seen_recently(state.sent_contract_cache, c, CROSS_STREAM_SUPPRESS_SECONDS):
+        return False
+    _mark_seen(state.sent_contract_cache, c)
+    return True
 
 async def telegram_send(text: str, client: httpx.AsyncClient) -> None:
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
@@ -399,6 +474,9 @@ class State:
     gpt_last_call_at: Optional[datetime] = None
     gpt_window_start: Optional[datetime] = None
     gpt_calls_in_window: int = 0
+    sent_cache: "OrderedDict[str, float]" = field(default_factory=OrderedDict)
+    sent_contract_cache: "OrderedDict[str, float]" = field(default_factory=OrderedDict)
+
 
 
 
@@ -606,6 +684,25 @@ def _gpt_allow_call() -> bool:
 async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> None:
     f = get_flow_fields(a)
 
+   # CROSS-STREAM suppression by contract (prevents Flow+Chain duplicating same contract)
+if not suppress_contract(f.get("contract") or ""):
+    return
+
+# Stable fingerprint for FLOW
+fp = stable_fingerprint([
+    "FLOW",
+    f.get("ticker", ""),
+    f.get("opt_type", ""),
+    f.get("contract", ""),
+    str(int((f.get("premium") or 0) / 1000)),   # bucket premium in $1k
+    str(f.get("side") or ""),
+    str(f.get("rule") or ""),
+])
+
+if not dedupe_event("evt:" + fp):
+    return
+
+
     # HARD GATES
     vol = f.get("volume") or 0
     oi = f.get("oi") or 0
@@ -801,6 +898,26 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         if not strong:
             log.info("Chain alert not strong enough for GPT; skipping")
             continue
+
+       contract = f.get("option_symbol") or ""
+
+# CROSS-STREAM suppression by contract (prevents Chain sending if Flow already sent)
+if not suppress_contract(contract):
+    continue
+
+# Stable fingerprint for CHAIN (don’t include time/reasons ordering)
+fp = stable_fingerprint([
+    "CHAIN",
+    ticker,
+    contract,
+    str(int((f.get("total_premium") or 0) / 1000)),  # bucket premium
+    str(f.get("volume") or 0),
+    str(f.get("open_interest") or 0),
+])
+
+if not dedupe_event("evt:" + fp):
+    continue
+
 
    
         await send_via_gpt_formatter("\n".join(lines), client)
