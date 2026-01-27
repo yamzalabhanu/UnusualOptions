@@ -599,7 +599,7 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
             f"• Time: `{now_utc().isoformat()}`",
         ]
    
-       await send_via_gpt_formatter("\n".join(lines), client)
+        await send_via_gpt_formatter("\n".join(lines), client)
 
 
 # ----------------------------
