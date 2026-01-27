@@ -105,6 +105,7 @@ GPT_CHAIN_MIN_VOLOI = float(os.getenv("GPT_CHAIN_MIN_VOLOI", "3.0"))
 GPT_CHAIN_MIN_OI_CHANGE = int(os.getenv("GPT_CHAIN_MIN_OI_CHANGE", "5000"))
 
 
+
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 log = logging.getLogger("uw_app")
 
@@ -581,33 +582,11 @@ def flow_alert_key(f: Dict[str, Any]) -> str:
     ])
     return sha16(raw)
 
-
-async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> None:
-    f = get_flow_fields(a)
-
-    # HARD GATES (NEW) — do this BEFORE cooldown so rejects don't consume cooldown
-    vol = f.get("volume") or 0
-    oi = f.get("oi") or 0
-    if vol < MIN_HARD_VOLUME:
-        return
-    if oi < MIN_HARD_OI:
-        return
-
-    score = score_flow_alert(f)
-    if score < MIN_SCORE_TO_ALERT:
-        return
-
-    key = "flow:" + flow_alert_key(f)
-    if not cooldown_ok(key):
-        return
-    ticker = f["ticker"]
-    tide = await get_market_tide(client)
-    dp = await get_darkpool_for_ticker(client, ticker)
-   
+# ---- GPT rate limiting (TOP LEVEL helper) ----
 def _gpt_allow_call() -> bool:
     now = now_utc()
 
-    # minimum spacing between GPT calls
+    # min spacing between GPT calls
     if state.gpt_last_call_at is not None:
         if (now - state.gpt_last_call_at).total_seconds() < GPT_MIN_SECONDS_BETWEEN_CALLS:
             return False
@@ -624,6 +603,27 @@ def _gpt_allow_call() -> bool:
     state.gpt_calls_in_window += 1
     return True
 
+async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> None:
+    f = get_flow_fields(a)
+
+    # HARD GATES
+    vol = f.get("volume") or 0
+    oi = f.get("oi") or 0
+    if vol < MIN_HARD_VOLUME or oi < MIN_HARD_OI:
+        return
+
+    score = score_flow_alert(f)
+    if score < MIN_SCORE_TO_ALERT:
+        return
+
+    key = "flow:" + flow_alert_key(f)
+    if not cooldown_ok(key):
+        return
+
+    ticker = f["ticker"]
+    tide = await get_market_tide(client)
+    dp = await get_darkpool_for_ticker(client, ticker)
+
     lines = [
         f"🚨 *UW Flow Alert* — *{ticker}* | *Score:* `{score}/100`",
         f"• Type/Side: `{f.get('opt_type')}` / `{str(f.get('side') or 'n/a')}` | Rule: `{f.get('rule')}`",
@@ -634,6 +634,18 @@ def _gpt_allow_call() -> bool:
         f"• Darkpool: {summarize_darkpool(dp)}",
         f"• Time: `{f.get('created_at')}`",
     ]
+
+    # Optional: only call GPT if allowed, otherwise send raw or skip
+    if _gpt_allow_call():
+        await send_via_gpt_formatter("\n".join(lines), client)
+    else:
+        # either skip OR fallback to direct telegram to avoid flooding OpenAI
+        # await telegram_send("\n".join(lines), client)
+        return
+
+    if f.get("created_at"):
+        state.flow_newer_than = f["created_at"]
+
    
     await send_via_gpt_formatter("\n".join(lines), client)
 
