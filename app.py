@@ -153,8 +153,16 @@ def require_env():
         raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
 
 def uw_headers() -> Dict[str, str]:
-    auth = f"Bearer {UW_TOKEN}" if UW_AUTH_BEARER and not UW_TOKEN.lower().startswith("bearer ") else UW_TOKEN
-    return {"Accept": "application/json, text/plain", "Authorization": auth}
+    if not UW_TOKEN:
+        return {"Accept": "application/json, text/plain"}
+    token = UW_TOKEN.strip()
+    if token.lower().startswith("bearer "):
+        token = token.split(" ", 1)[1].strip()
+    return {
+        "Accept": "application/json, text/plain",
+        "Authorization": f"Bearer {token}",
+    }
+
 
 def h(x: Any) -> str:
     return html.escape("" if x is None else str(x))
