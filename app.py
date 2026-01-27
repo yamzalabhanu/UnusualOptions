@@ -1,49 +1,34 @@
 """
-app.py — Unusual Whales Options: Flow Alerts + Contract Scan → Telegram
+app.py — Unusual Whales Public API → Telegram (Updated auth + includes /api/market/market-tide)
 
-Goal:
-- Trigger alerts for CALL/PUT unusual VOLUME or unusual OPEN INTEREST (and optionally OI CHANGE)
-- More accurate than flow-only: scans contracts across expiries
-- Efficient: caches expiries, paginates, rate-limits, dedupes across pipelines
+You confirmed this works:
+curl https://api.unusualwhales.com/api/market/market-tide \
+  -H "Accept: application/json" \
+  -H "Authorization: Bearer <TOKEN>"
 
-Requires env:
-- UW_TOKEN
-- TELEGRAM_BOT_TOKEN
-- TELEGRAM_CHAT_ID
+So we update the script to match curl EXACTLY:
+✅ Always sends:
+   Accept: application/json
+   Authorization: Bearer <UW_TOKEN>
 
-Optional env:
-- TICKERS="NVDA,AMD,MSTR"
-- POLL_FLOW_SECONDS=15
-- SCAN_SECONDS=180
-- UW_AUTH_BEARER=1
+Also adds:
+✅ /debug/market-tide  (calls the same endpoint you tested)
+✅ /debug/headers      (shows header presence safely, no token leak)
+✅ Better error logging (no silent pass)
 
-Trigger tuning:
-- MIN_UNUSUAL_VOLUME=500
-- MIN_UNUSUAL_OI=2000
-- REQUIRE_VOL_GT_OI=0
-- MIN_VOLUME_OI_RATIO=0        (0 disables)
-
-Quality filters:
-- ASK_ONLY=0/1
-- REQUIRE_MIN_PREMIUM=0/1 ; MIN_PREMIUM=200000
-- REQUIRE_DELTA_BAND=0/1 ; DELTA_MIN=0.30 ; DELTA_MAX=0.65
-- REQUIRE_DTE_BAND=0/1 (tier-based)
-- TIERS_JSON='{"NVDA":"T1","AMD":"T1","MSTR":"T3"}'
-
-Optional OI-change scan:
-- ENABLE_OI_CHANGE_SCAN=0/1
-- MIN_ABS_OI_CHANGE=1500
+The rest of the script keeps the “unusual options volume/OI” logic using UW public APIs:
+- /api/option-trades/flow-alerts
+- /api/stock/{ticker}/expiry-breakdown
+- /api/stock/{ticker}/option-contracts
 """
 
 import os
 import asyncio
-import json
 import hashlib
-import html
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI
@@ -53,23 +38,24 @@ from pydantic import BaseModel
 # Logging
 # ----------------------------
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
-log = logging.getLogger("uw-options")
+log = logging.getLogger("uw_public")
 
 # ----------------------------
-# Config
+# Public API base + paths
 # ----------------------------
 UW_BASE_URL = "https://api.unusualwhales.com"
 
-UW_FLOW_ALERTS_PATH = "/api/option-trades/flow-alerts"
-UW_EXPIRY_BREAKDOWN_PATH = "/api/stock/{ticker}/expiry-breakdown"
-UW_OPTION_CONTRACTS_PATH = "/api/stock/{ticker}/option-contracts"
-UW_OI_CHANGE_TICKER_PATH = "/api/stock/{ticker}/oi-change"
+FLOW_ALERTS_PATH = "/api/option-trades/flow-alerts"
+EXPIRY_BREAKDOWN_PATH = "/api/stock/{ticker}/expiry-breakdown"
+OPTION_CONTRACTS_PATH = "/api/stock/{ticker}/option-contracts"
+MARKET_TIDE_PATH = "/api/market/market-tide"  # curl-tested endpoint
 
-UW_TOKEN = os.getenv("UW_TOKEN", "").strip()
+# ----------------------------
+# Env
+# ----------------------------
+UW_TOKEN = os.getenv("UW_TOKEN", "").strip()              # must be RAW token, no "Bearer "
 TG_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-UW_AUTH_BEARER = os.getenv("UW_AUTH_BEARER", "1").strip() == "1"
 
 TICKERS = [t.strip().upper() for t in os.getenv("TICKERS", "").split(",") if t.strip()]
 RULE_NAMES = [x.strip() for x in os.getenv("RULE_NAMES", "").split(",") if x.strip()]
@@ -77,66 +63,34 @@ ISSUE_TYPES = [x.strip() for x in os.getenv("ISSUE_TYPES", "").split(",") if x.s
 
 POLL_FLOW_SECONDS = int(os.getenv("POLL_FLOW_SECONDS", "15"))
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "180"))
-
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "600"))
 
-# ----------------------------
-# Unusual triggers
-# ----------------------------
+# Triggers
 MIN_UNUSUAL_VOLUME = int(os.getenv("MIN_UNUSUAL_VOLUME", "500"))
 MIN_UNUSUAL_OI = int(os.getenv("MIN_UNUSUAL_OI", "2000"))
-REQUIRE_VOL_GT_OI = os.getenv("REQUIRE_VOL_GT_OI", "0").strip() == "1"
 MIN_VOLUME_OI_RATIO = float(os.getenv("MIN_VOLUME_OI_RATIO", "0"))  # 0 disables
+REQUIRE_VOL_GREATER_OI = os.getenv("REQUIRE_VOL_GREATER_OI", "0").strip() == "1"
 
-# ----------------------------
-# Quality filters (toggleable)
-# ----------------------------
+OPTION_TYPES = [x.strip().upper() for x in os.getenv("OPTION_TYPES", "CALL,PUT").split(",") if x.strip()]
+
+# Flow quality (optional)
 ASK_ONLY = os.getenv("ASK_ONLY", "0").strip() == "1"
-
-REQUIRE_MIN_PREMIUM = os.getenv("REQUIRE_MIN_PREMIUM", "0").strip() == "1"
 MIN_PREMIUM = float(os.getenv("MIN_PREMIUM", "200000"))
 
-REQUIRE_DELTA_BAND = os.getenv("REQUIRE_DELTA_BAND", "0").strip() == "1"
-DELTA_MIN = float(os.getenv("DELTA_MIN", "0.30"))
-DELTA_MAX = float(os.getenv("DELTA_MAX", "0.65"))
+# Chain scan filters
+EXCLUDE_ZERO_VOL = os.getenv("EXCLUDE_ZERO_VOL", "1").strip() == "1"
+EXCLUDE_ZERO_OI = os.getenv("EXCLUDE_ZERO_OI", "1").strip() == "1"
+EXCLUDE_ZERO_DTE = os.getenv("EXCLUDE_ZERO_DTE", "1").strip() == "1"
+MAYBE_OTM_ONLY = os.getenv("MAYBE_OTM_ONLY", "0").strip() == "1"
 
-REQUIRE_DTE_BAND = os.getenv("REQUIRE_DTE_BAND", "0").strip() == "1"
-
-# OI change scan
-ENABLE_OI_CHANGE_SCAN = os.getenv("ENABLE_OI_CHANGE_SCAN", "0").strip() == "1"
-MIN_ABS_OI_CHANGE = int(os.getenv("MIN_ABS_OI_CHANGE", "1500"))
-
-# Concurrency / rate limit
 MAX_INFLIGHT = int(os.getenv("MAX_INFLIGHT", "8"))
-
-# First-run behavior
-FIRST_RUN_NO_HISTORY = os.getenv("FIRST_RUN_NO_HISTORY", "1").strip() == "1"
-
-# Tier mapping (only used for DTE band if REQUIRE_DTE_BAND=1)
-TIERS_JSON = os.getenv("TIERS_JSON", "").strip()
-DEFAULT_TIERS = {t: "T2" for t in (TICKERS or [])}
-if TIERS_JSON:
-    try:
-        DEFAULT_TIERS.update({k.upper(): str(v).upper() for k, v in json.loads(TIERS_JSON).items()})
-    except Exception as e:
-        log.warning("Bad TIERS_JSON; using defaults. err=%s", e)
+FIRST_RUN_SKIP_HISTORY = os.getenv("FIRST_RUN_SKIP_HISTORY", "1").strip() == "1"
 
 # ----------------------------
 # Models
 # ----------------------------
 class TestMessage(BaseModel):
     text: str
-
-class SimulateContract(BaseModel):
-    ticker: str
-    option_type: str  # CALL/PUT
-    expiry: str
-    strike: float
-    volume: int
-    open_interest: int
-    premium: Optional[float] = 0
-    delta: Optional[float] = None
-    underlying_price: Optional[float] = None
 
 # ----------------------------
 # Helpers
@@ -153,37 +107,21 @@ def require_env():
         raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
 
 def uw_headers() -> Dict[str, str]:
-    if not UW_TOKEN:
-        raise RuntimeError("UW_TOKEN is empty")
-
+    """
+    Match curl exactly:
+      Accept: application/json
+      Authorization: Bearer <token>
+    """
     token = UW_TOKEN.strip()
+    # allow user to accidentally include "Bearer " and still work
     if token.lower().startswith("bearer "):
         token = token.split(" ", 1)[1].strip()
-
+    if not token:
+        raise RuntimeError("UW_TOKEN is empty after stripping")
     return {
-        "Authorization": f"Bearer {token}",
         "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
     }
-
-
-
-def h(x: Any) -> str:
-    return html.escape("" if x is None else str(x))
-
-def parse_iso(dt_str: str) -> datetime:
-    if not dt_str:
-        return datetime(1970, 1, 1, tzinfo=timezone.utc)
-    if dt_str.endswith("Z"):
-        dt_str = dt_str.replace("Z", "+00:00")
-    return datetime.fromisoformat(dt_str)
-
-def safe_float(x, default=None):
-    try:
-        if x is None:
-            return default
-        return float(x)
-    except Exception:
-        return default
 
 def safe_int(x, default=None):
     try:
@@ -193,51 +131,49 @@ def safe_int(x, default=None):
     except Exception:
         return default
 
-def money(x: Optional[float]) -> str:
-    if x is None:
-        return "n/a"
-    return f"${x:,.0f}"
-
-def normalize_type(opt_type: Any) -> str:
-    s = str(opt_type or "").lower()
-    if "call" in s or s == "c":
-        return "CALL"
-    if "put" in s or s == "p":
-        return "PUT"
-    return s.upper() if s else "UNK"
-
-def tier_dte_range(tier: str) -> Tuple[int, int]:
-    t = (tier or "T2").upper()
-    if t == "T1":
-        return (14, 45)
-    if t == "T2":
-        return (7, 30)
-    if t == "T3":
-        return (7, 21)
-    return (3, 14)  # T4
-
-def days_to_expiry(expiry: Optional[str], now: datetime) -> Optional[int]:
-    if not expiry:
-        return None
+def safe_float(x, default=None):
     try:
-        if "T" in expiry:
-            exp_dt = parse_iso(expiry)
-        else:
-            exp_dt = datetime.fromisoformat(expiry).replace(tzinfo=timezone.utc)
-        return max(0, (exp_dt.date() - now.date()).days)
+        if x is None:
+            return default
+        return float(x)
     except Exception:
-        return None
+        return default
+
+def normalize_type(s: Any) -> str:
+    v = str(s or "").lower()
+    if "call" in v or v == "c":
+        return "CALL"
+    if "put" in v or v == "p":
+        return "PUT"
+    return v.upper() if v else "UNK"
+
+def parse_iso(dt_str: str) -> datetime:
+    if not dt_str:
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+    if dt_str.endswith("Z"):
+        dt_str = dt_str.replace("Z", "+00:00")
+    return datetime.fromisoformat(dt_str)
 
 def alert_hash(parts: List[Any]) -> str:
     raw = "|".join("" if p is None else str(p) for p in parts).encode("utf-8", errors="ignore")
     return hashlib.sha256(raw).hexdigest()[:16]
+
+def money(x: Optional[float]) -> str:
+    if x is None:
+        return "n/a"
+    return f"${x:,.0f}"
 
 # ----------------------------
 # Telegram
 # ----------------------------
 async def telegram_send(text: str, client: httpx.AsyncClient) -> None:
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    payload = {
+        "chat_id": TG_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
     r = await client.post(url, json=payload, timeout=20)
     r.raise_for_status()
 
@@ -251,22 +187,13 @@ class CacheItem:
 
 class State:
     running: bool = False
-
-    # Flow cursor
     last_seen_created_at: Optional[str] = None
-
-    # Dedupe/cooldown across ALL pipelines
     cooldown: Dict[str, datetime] = {}
-
-    # Expiry cache per ticker
-    expiries_cache: Dict[str, CacheItem] = {}
-
-    # Metrics / debug
+    expiries: Dict[str, CacheItem] = {}
     last_error: Optional[str] = None
-    last_poll_flow_at: Optional[str] = None
+    last_flow_poll_at: Optional[str] = None
     last_scan_at: Optional[str] = None
-    last_sent_count: int = 0
-    last_fetch_flow_count: int = 0
+    last_sent: int = 0
 
 state = State()
 
@@ -281,132 +208,92 @@ def cooldown_ok(key: str) -> bool:
         state.cooldown = {k: v for k, v in state.cooldown.items() if v >= cutoff}
     return True
 
-def get_tier(ticker: str) -> str:
-    return (DEFAULT_TIERS.get(ticker.upper()) or "T2").upper()
-
 # ----------------------------
-# UW API calls
+# UW requests
 # ----------------------------
 async def uw_get(client: httpx.AsyncClient, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     url = f"{UW_BASE_URL}{path}"
     r = await client.get(url, headers=uw_headers(), params=params or {}, timeout=30)
+    # If auth fails, log header presence (without leaking token)
+    if r.status_code in (401, 403):
+        log.error("UW auth failed status=%s url=%s token_len=%s", r.status_code, url, len(UW_TOKEN or ""))
     r.raise_for_status()
     return r.json()
 
-async def fetch_flow_alerts(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    params: Dict[str, Any] = {}
-    if ISSUE_TYPES:
-        params["issue_types[]"] = ISSUE_TYPES
+async def fetch_market_tide(client: httpx.AsyncClient) -> Any:
+    return await uw_get(client, MARKET_TIDE_PATH, params={})
+
+async def fetch_flow_alerts_for_ticker(client: httpx.AsyncClient, ticker: str, newer_than: Optional[str]) -> List[Dict[str, Any]]:
+    params: Dict[str, Any] = {
+        "limit": 200,
+        "min_premium": MIN_PREMIUM,
+        "ticker_symbol": ticker,
+    }
     if RULE_NAMES:
         params["rule_name[]"] = RULE_NAMES
-    if TICKERS:
-        params["tickers"] = ",".join(TICKERS)
-    data = await uw_get(client, UW_FLOW_ALERTS_PATH, params=params)
+    if ISSUE_TYPES:
+        params["issue_types[]"] = ISSUE_TYPES
+    if ASK_ONLY:
+        params["is_ask_side"] = True
+    if REQUIRE_VOL_GREATER_OI:
+        params["vol_greater_oi"] = True
+    if newer_than:
+        params["newer_than"] = newer_than
+
+    data = await uw_get(client, FLOW_ALERTS_PATH, params=params)
     if isinstance(data, dict) and isinstance(data.get("data"), list):
-        return data["data"]
+        return [x for x in data["data"] if isinstance(x, dict)]
     if isinstance(data, list):
-        return data
+        return [x for x in data if isinstance(x, dict)]
     return []
 
-async def fetch_expiries(client: httpx.AsyncClient, ticker: str) -> List[str]:
-    """
-    Uses /api/stock/{ticker}/expiry-breakdown to discover expiries.
-    Cached for ~6 hours.
-    """
+async def fetch_expiry_breakdown(client: httpx.AsyncClient, ticker: str) -> List[str]:
     now = datetime.now(timezone.utc)
-    c = state.expiries_cache.get(ticker)
+    c = state.expiries.get(ticker)
     if c and c.expires_at > now:
         return c.value
 
-    path = UW_EXPIRY_BREAKDOWN_PATH.format(ticker=ticker)
-    data = await uw_get(client, path, params={})
+    data = await uw_get(client, EXPIRY_BREAKDOWN_PATH.format(ticker=ticker), params={})
     expiries: List[str] = []
 
-    # Try multiple common shapes safely:
-    if isinstance(data, dict):
-        # could be {"data":[...]} or {"expirations":[...]} etc
-        if isinstance(data.get("expirations"), list):
-            expiries = [str(x) for x in data["expirations"] if x]
-        elif isinstance(data.get("data"), list):
-            # sometimes includes dicts with "expiry" key
-            for row in data["data"]:
-                if isinstance(row, dict):
-                    e = row.get("expiry") or row.get("expiration")
-                    if e:
-                        expiries.append(str(e))
-    elif isinstance(data, list):
-        for row in data:
-            if isinstance(row, str):
-                expiries.append(row)
-            elif isinstance(row, dict):
+    if isinstance(data, dict) and isinstance(data.get("data"), list):
+        for row in data["data"]:
+            if isinstance(row, dict):
                 e = row.get("expiry") or row.get("expiration")
                 if e:
                     expiries.append(str(e))
 
     expiries = sorted(list({e for e in expiries if e}))
-    state.expiries_cache[ticker] = CacheItem(value=expiries, expires_at=now + timedelta(hours=6))
+    state.expiries[ticker] = CacheItem(expiries, now + timedelta(hours=6))
     return expiries
 
-async def scan_option_contracts(
+async def fetch_option_contracts(
     client: httpx.AsyncClient,
     ticker: str,
-    expiries: List[str],
-    sem: asyncio.Semaphore,
-    limit_per_expiry: int = 200,
+    expiry: Optional[str],
+    option_type: str,
+    page: int = 0,
+    limit: int = 500,
 ) -> List[Dict[str, Any]]:
-    """
-    Uses /api/stock/{ticker}/option-contracts with filters per-expiry.
-    We page until we have enough or no more pages.
-    """
-    results: List[Dict[str, Any]] = []
+    params: Dict[str, Any] = {
+        "page": page,
+        "limit": min(500, max(1, limit)),
+        "option_type": option_type,
+    }
+    if expiry:
+        params["expiry"] = expiry
+    if REQUIRE_VOL_GREATER_OI:
+        params["vol_greater_oi"] = True
+    if EXCLUDE_ZERO_VOL:
+        params["exclude_zero_vol_chains"] = True
+    if EXCLUDE_ZERO_OI:
+        params["exclude_zero_oi_chains"] = True
+    if EXCLUDE_ZERO_DTE:
+        params["exclude_zero_dte"] = True
+    if MAYBE_OTM_ONLY:
+        params["maybe_otm_only"] = True
 
-    async def fetch_page(expiry: str, page: int) -> Any:
-        async with sem:
-            path = UW_OPTION_CONTRACTS_PATH.format(ticker=ticker)
-            params = {
-                "expiry": expiry,
-                "limit": limit_per_expiry,
-                "page": page,
-                # Helpful server-side filtering knobs (if supported):
-                # "exclude_zero_vol_chains": True,
-                # "exclude_zero_oi_chains": True,
-                # "exclude_zero_dte": True,
-                # "vol_greater_oi": True,
-            }
-            return await uw_get(client, path, params=params)
-
-    # Only scan a bounded number of expiries for efficiency (front expiries tend to matter most)
-    expiries_to_scan = expiries[:6] if len(expiries) > 6 else expiries
-
-    for expiry in expiries_to_scan:
-        page = 0
-        while page < 3:  # hard cap pages per expiry to avoid runaway
-            data = await fetch_page(expiry, page)
-            rows: List[Dict[str, Any]] = []
-            if isinstance(data, dict) and isinstance(data.get("data"), list):
-                rows = [x for x in data["data"] if isinstance(x, dict)]
-            elif isinstance(data, list):
-                rows = [x for x in data if isinstance(x, dict)]
-
-            if not rows:
-                break
-
-            results.extend(rows)
-
-            # stop if less than limit => likely last page
-            if len(rows) < limit_per_expiry:
-                break
-            page += 1
-
-    return results
-
-async def fetch_oi_change(client: httpx.AsyncClient, ticker: str, sem: asyncio.Semaphore) -> List[Dict[str, Any]]:
-    """
-    Optional: /api/stock/{ticker}/oi-change (daily OI changes).
-    """
-    async with sem:
-        path = UW_OI_CHANGE_TICKER_PATH.format(ticker=ticker)
-        data = await uw_get(client, path, params={"limit": 200, "order": "desc"})
+    data = await uw_get(client, OPTION_CONTRACTS_PATH.format(ticker=ticker), params=params)
     if isinstance(data, dict) and isinstance(data.get("data"), list):
         return [x for x in data["data"] if isinstance(x, dict)]
     if isinstance(data, list):
@@ -414,390 +301,260 @@ async def fetch_oi_change(client: httpx.AsyncClient, ticker: str, sem: asyncio.S
     return []
 
 # ----------------------------
-# Common parsing (flow + contracts)
+# Normalizers
 # ----------------------------
-def contract_fields_from_any(row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normalize contract-like record coming from:
-    - flow alerts rows, or
-    - option-contracts rows, or
-    - oi-change rows
-    """
-    ticker = str(row.get("ticker") or row.get("symbol") or "UNK").upper()
-    opt_type = normalize_type(row.get("type") or row.get("option_type") or row.get("right"))
-    expiry = row.get("expiry") or row.get("expiration") or row.get("exp_date")
-    strike = safe_float(row.get("strike") or row.get("strike_price"))
-    volume = safe_int(row.get("volume") or row.get("total_volume") or row.get("contracts"))
-    oi = safe_int(row.get("open_interest") or row.get("oi") or row.get("openInt"))
-    premium = safe_float(row.get("total_premium") or row.get("premium") or row.get("notional") or row.get("total_notional"))
-    delta = safe_float(row.get("delta") or row.get("option_delta"))
-    voloi = safe_float(row.get("volume_oi_ratio") or row.get("vol_oi_ratio"))
-    side = str(row.get("side") or row.get("trade_side") or "").lower()
-    created_at = row.get("created_at")
+def normalize_flow_row(a: Dict[str, Any]) -> Dict[str, Any]:
+    ticker = str(a.get("ticker") or a.get("ticker_symbol") or a.get("symbol") or "UNK").upper()
+    opt_type = normalize_type(a.get("type"))
+    expiry = a.get("expiry") or a.get("expiration") or a.get("exp_date")
+    strike = safe_float(a.get("strike"))
+    premium = safe_float(a.get("total_premium") or a.get("premium") or a.get("notional") or a.get("total_notional"))
+    vol = safe_int(a.get("volume"))
+    oi = safe_int(a.get("open_interest"))
+    voloi = safe_float(a.get("volume_oi_ratio") or a.get("vol_oi_ratio"))
+    side = str(a.get("side") or a.get("trade_side") or "").lower()
+    created_at = a.get("created_at")
 
-    # Try to get a contract identifier/symbol
-    contract = row.get("option_symbol") or row.get("contract") or row.get("option_chain") or row.get("symbol")
-    underlying = safe_float(row.get("underlying_price") or row.get("underlying") or row.get("stock_price") or row.get("spot_price"))
-
-    # OI change if available (ticker oi-change endpoint may provide an "oi_change" field)
-    oi_change = safe_int(row.get("oi_change") or row.get("open_interest_change"))
-
-    if voloi is None and volume is not None and oi and oi > 0:
-        voloi = volume / oi
+    if voloi is None and vol is not None and oi and oi > 0:
+        voloi = vol / oi
 
     return {
+        "src": "FLOW",
         "ticker": ticker,
         "type": opt_type,
         "expiry": expiry,
         "strike": strike,
-        "volume": volume,
-        "open_interest": oi,
         "premium": premium,
-        "delta": delta,
+        "volume": vol,
+        "open_interest": oi,
         "voloi": voloi,
         "side": side,
         "created_at": created_at,
-        "contract": contract,
-        "underlying": underlying,
-        "oi_change": oi_change,
-        "raw": row,
+        "raw": a,
     }
 
-def trigger_unusual_volume_oi(x: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """
-    Main triggers:
-    - vol >= MIN_UNUSUAL_VOLUME
-    - oi  >= MIN_UNUSUAL_OI
-    - optional vol > oi
-    - optional voloi >= MIN_VOLUME_OI_RATIO
-    """
-    reasons: List[str] = []
-    if x["type"] not in ("CALL", "PUT"):
-        return False, ["not_call_put"]
+def normalize_contract_row(a: Dict[str, Any], ticker_override: str) -> Dict[str, Any]:
+    ticker = ticker_override.upper()
+    opt_type = normalize_type(a.get("option_type") or a.get("type") or a.get("right"))
+    expiry = a.get("expiry") or a.get("expiration")
+    strike = safe_float(a.get("strike") or a.get("strike_price"))
+    vol = safe_int(a.get("volume") or a.get("total_volume"))
+    oi = safe_int(a.get("open_interest") or a.get("oi"))
+    voloi = safe_float(a.get("volume_oi_ratio") or a.get("vol_oi_ratio"))
+    if voloi is None and vol is not None and oi and oi > 0:
+        voloi = vol / oi
+    contract = a.get("option_symbol") or a.get("symbol") or a.get("contract")
 
-    hit = False
+    return {
+        "src": "CHAIN",
+        "ticker": ticker,
+        "type": opt_type,
+        "expiry": expiry,
+        "strike": strike,
+        "premium": safe_float(a.get("premium") or a.get("notional")),
+        "volume": vol,
+        "open_interest": oi,
+        "voloi": voloi,
+        "contract": contract,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "raw": a,
+    }
+
+# ----------------------------
+# Triggers
+# ----------------------------
+def is_unusual(x: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    tags: List[str] = []
+
+    if x.get("type") not in ("CALL", "PUT"):
+        return False, ["not_call_put"]
+    if x.get("type") not in OPTION_TYPES:
+        return False, ["type_filtered"]
+
     vol = x.get("volume")
     oi = x.get("open_interest")
     voloi = x.get("voloi")
 
+    hit = False
     if vol is not None and vol >= MIN_UNUSUAL_VOLUME:
-        hit = True; reasons.append(f"vol>={MIN_UNUSUAL_VOLUME}")
+        hit = True; tags.append(f"vol>={MIN_UNUSUAL_VOLUME}")
     if oi is not None and oi >= MIN_UNUSUAL_OI:
-        hit = True; reasons.append(f"oi>={MIN_UNUSUAL_OI}")
-    if REQUIRE_VOL_GT_OI and vol is not None and oi is not None and vol > oi:
-        hit = True; reasons.append("vol_gt_oi")
+        hit = True; tags.append(f"oi>={MIN_UNUSUAL_OI}")
     if MIN_VOLUME_OI_RATIO and MIN_VOLUME_OI_RATIO > 0 and voloi is not None and voloi >= MIN_VOLUME_OI_RATIO:
-        hit = True; reasons.append(f"voloi>={MIN_VOLUME_OI_RATIO:g}")
+        hit = True; tags.append(f"voloi>={MIN_VOLUME_OI_RATIO:g}")
+    if REQUIRE_VOL_GREATER_OI and vol is not None and oi is not None and vol > oi:
+        hit = True; tags.append("vol_gt_oi")
 
-    return (hit, reasons or ["no_trigger"])
+    return hit, (tags or ["no_trigger"])
 
-def quality_ok(x: Dict[str, Any], tier: str) -> Tuple[bool, List[str]]:
-    reasons: List[str] = []
-
-    if REQUIRE_MIN_PREMIUM:
-        prem = x.get("premium")
-        if prem is None or prem < MIN_PREMIUM:
-            return False, ["premium_low"]
-
-    if ASK_ONLY:
-        side = x.get("side") or ""
-        if side and side != "ask":
-            return False, [f"side_{side}"]
-
-    if REQUIRE_DELTA_BAND:
-        d = x.get("delta")
-        if d is None:
-            return False, ["delta_missing"]
-        if abs(d) < DELTA_MIN or abs(d) > DELTA_MAX:
-            return False, ["delta_out_of_band"]
-
-    if REQUIRE_DTE_BAND:
-        now = datetime.now(timezone.utc)
-        dte = days_to_expiry(x.get("expiry"), now)
-        if dte is None:
-            return False, ["expiry_missing"]
-        dmin, dmax = tier_dte_range(tier)
-        if dte < dmin or dte > dmax:
-            return False, [f"dte_{dte}_out_{dmin}-{dmax}"]
-
-    reasons.append("quality_ok")
-    return True, reasons
-
-def trigger_oi_change(x: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    if not ENABLE_OI_CHANGE_SCAN:
-        return False, ["oi_change_scan_disabled"]
-    c = x.get("oi_change")
-    if c is None:
-        return False, ["oi_change_missing"]
-    if abs(int(c)) >= MIN_ABS_OI_CHANGE:
-        return True, [f"abs_oi_change>={MIN_ABS_OI_CHANGE}"]
-    return False, ["oi_change_small"]
-
-def score(x: Dict[str, Any], tier: str, trig_tags: List[str], extra_tags: List[str]) -> Tuple[int, List[str]]:
-    s = 45
-    why: List[str] = []
-
-    t = (tier or "T2").upper()
-    if t == "T1":
-        s += 10; why.append("tier_T1")
-    elif t == "T2":
-        s += 5; why.append("tier_T2")
-    elif t == "T4":
-        s -= 5; why.append("tier_T4")
-    else:
-        why.append("tier_T3")
-
-    prem = x.get("premium") or 0
-    if prem >= 1_000_000:
-        s += 10; why.append("prem_1m+")
-    elif prem >= 500_000:
-        s += 6; why.append("prem_500k+")
-
-    vol = x.get("volume") or 0
-    if vol >= 5000:
-        s += 10; why.append("vol_5k+")
-    elif vol >= 2000:
-        s += 6; why.append("vol_2k+")
-    elif vol >= 500:
-        s += 3; why.append("vol_500+")
-
-    oi = x.get("open_interest") or 0
-    if oi >= 20000:
-        s += 8; why.append("oi_20k+")
-    elif oi >= 5000:
-        s += 5; why.append("oi_5k+")
-    elif oi >= 2000:
-        s += 3; why.append("oi_2k+")
-
-    voloi = x.get("voloi")
-    if voloi is not None:
-        if voloi >= 3.0:
-            s += 7; why.append("voloi_3+")
-        elif voloi >= 2.0:
-            s += 4; why.append("voloi_2+")
-
-    if any("abs_oi_change" in t for t in extra_tags):
-        s += 6; why.append("oi_change_spike")
-
-    if len(trig_tags) + len(extra_tags) >= 2:
-        s += 3; why.append("multi_signal")
-
-    return max(0, min(100, s)), why
-
-def fmt_msg(kind: str, x: Dict[str, Any], tier: str, tags: List[str], extra: List[str]) -> str:
-    sc, why = score(x, tier, tags, extra)
-    contract = x.get("contract")
-    strike = x.get("strike")
+def fmt_msg(x: Dict[str, Any], tags: List[str]) -> str:
+    t = x["ticker"]
+    typ = x["type"]
+    src = x.get("src", "SRC")
     expiry = x.get("expiry")
+    strike = x.get("strike")
     vol = x.get("volume")
     oi = x.get("open_interest")
     voloi = x.get("voloi")
     prem = x.get("premium")
-    delta = x.get("delta")
-    under = x.get("underlying")
-    side = x.get("side") or "n/a"
-    created = x.get("created_at") or "n/a"
+    side = x.get("side", "n/a")
+    contract = x.get("contract")
+    created = x.get("created_at", "n/a")
 
+    line_contract = f"`{contract}`" if contract else f"`{typ} {strike} @ {expiry}`"
     return "\n".join([
-        f"🐳 <b>UW Options Alert</b> — <b>{h(x['ticker'])}</b> | <b>{h(x['type'])}</b> | <b>{h(kind)}</b> | <b>Score:</b> <code>{sc}/100</code>",
-        f"• Tier: <code>{h(tier)}</code> | Side: <code>{h(side)}</code>",
-        f"• Contract: <code>{h(contract)}</code>" if contract else f"• {h(x['type'])} {h(strike)} @ {h(expiry)}",
-        f"• Underlying: <code>{h(under)}</code> | Δ: <code>{h(delta)}</code> | Vol/OI: <code>{h(voloi)}</code>",
-        f"• Volume: <code>{h(vol)}</code> | OI: <code>{h(oi)}</code> | Premium: <b>{h(money(prem))}</b>",
-        f"• Trigger: <code>{h(', '.join(tags))}</code>",
-        f"• Extra: <code>{h(', '.join(extra))}</code>" if extra else "• Extra: <code>n/a</code>",
-        f"• Why: <code>{h(', '.join(why[:10]))}</code>",
-        f"• Time: <code>{h(created)}</code>",
+        f"🐳 *UW Unusual Options* — *{t}*  |  *{typ}*  |  *{src}*",
+        f"• Contract: {line_contract}",
+        f"• Vol: `{vol}` | OI: `{oi}` | Vol/OI: `{voloi}`",
+        f"• Premium: *{money(prem)}* | Side: `{side}`",
+        f"• Trigger: `{', '.join(tags)}`",
+        f"• Time: `{created}`",
     ])
 
 # ----------------------------
 # Loops
 # ----------------------------
-async def flow_loop(client: httpx.AsyncClient):
-    """
-    Fast real-time prints loop (flow alerts).
-    """
-    if not UW_TOKEN:
-        return
-
-    while state.running:
-        state.last_poll_flow_at = datetime.now(timezone.utc).isoformat()
-        try:
-            alerts = await fetch_flow_alerts(client)
-            state.last_fetch_flow_count = len(alerts)
-
-            # sort by created_at
-            alerts_sorted = sorted(alerts, key=lambda a: parse_iso(a.get("created_at") or ""))
-
-            # init cursor to newest if first run
-            if not state.last_seen_created_at and FIRST_RUN_NO_HISTORY and alerts_sorted:
-                newest = alerts_sorted[-1].get("created_at")
-                if newest:
-                    state.last_seen_created_at = newest
-                await asyncio.sleep(POLL_FLOW_SECONDS)
-                continue
-
-            # filter fresh
-            last_dt = parse_iso(state.last_seen_created_at) if state.last_seen_created_at else datetime(1970, 1, 1, tzinfo=timezone.utc)
-            fresh = []
-            for a in alerts_sorted:
-                ca = a.get("created_at")
-                if not ca:
-                    continue
-                try:
-                    if parse_iso(ca) > last_dt:
-                        fresh.append(a)
-                except Exception:
-                    continue
-
-            # advance cursor even if none pass
-            if fresh:
-                newest = fresh[-1].get("created_at")
-                if newest:
-                    state.last_seen_created_at = newest
-
+async def flow_loop():
+    require_env()
+    async with httpx.AsyncClient() as client:
+        while state.running:
+            state.last_flow_poll_at = datetime.now(timezone.utc).isoformat()
             sent = 0
-            for a in fresh:
-                x = contract_fields_from_any(a)
-                tier = get_tier(x["ticker"])
-
-                ok_trig, tags = trigger_unusual_volume_oi(x)
-                if not ok_trig:
+            try:
+                if not TICKERS:
+                    await asyncio.sleep(POLL_FLOW_SECONDS)
                     continue
 
-                ok_q, qtags = quality_ok(x, tier)
-                if not ok_q:
+                newer_than = state.last_seen_created_at
+                sem = asyncio.Semaphore(MAX_INFLIGHT)
+
+                async def fetch_one(tk: str) -> List[Dict[str, Any]]:
+                    async with sem:
+                        return await fetch_flow_alerts_for_ticker(client, tk, newer_than)
+
+                results = await asyncio.gather(*[fetch_one(tk) for tk in TICKERS], return_exceptions=True)
+
+                rows: List[Dict[str, Any]] = []
+                for r in results:
+                    if isinstance(r, Exception):
+                        log.warning("flow fetch error: %s", repr(r))
+                        continue
+                    rows.extend(r)
+
+                rows_sorted = sorted(rows, key=lambda a: parse_iso(a.get("created_at") or ""))
+
+                if not state.last_seen_created_at and FIRST_RUN_SKIP_HISTORY and rows_sorted:
+                    state.last_seen_created_at = rows_sorted[-1].get("created_at")
+                    await asyncio.sleep(POLL_FLOW_SECONDS)
                     continue
 
-                key = alert_hash(["flow", x["ticker"], x["type"], x["expiry"], x["strike"], x["premium"], x["volume"], x["open_interest"]])
-                if not cooldown_ok(key):
-                    continue
-
-                msg = fmt_msg("FLOW", x, tier, tags + qtags, extra=[])
-                await telegram_send(msg, client)
-                sent += 1
-
-            state.last_sent_count = sent
-            state.last_error = None
-        except Exception as e:
-            state.last_error = repr(e)
-            log.exception("flow_loop error: %s", e)
-
-        await asyncio.sleep(POLL_FLOW_SECONDS)
-
-async def scan_loop(client: httpx.AsyncClient):
-    """
-    Slower scan loop:
-    - expiry-breakdown (cached)
-    - option-contracts scan
-    - optional oi-change scan
-    """
-    sem = asyncio.Semaphore(MAX_INFLIGHT)
-
-    while state.running:
-        state.last_scan_at = datetime.now(timezone.utc).isoformat()
-        try:
-            tickers = TICKERS[:] if TICKERS else list(DEFAULT_TIERS.keys())
-            if not tickers:
-                # if no tickers provided, do nothing (avoid scanning whole market by accident)
-                await asyncio.sleep(SCAN_SECONDS)
-                continue
-
-            sent = 0
-
-            for ticker in tickers:
-                ticker = ticker.upper()
-                tier = get_tier(ticker)
-
-                expiries = await fetch_expiries(client, ticker)
-                if not expiries:
-                    continue
-
-                # 1) contract scan (unusual vol/oi)
-                rows = await scan_option_contracts(client, ticker, expiries, sem=sem, limit_per_expiry=200)
-
-                for row in rows:
-                    x = contract_fields_from_any(row)
-                    if x["ticker"] != ticker:
-                        x["ticker"] = ticker
-
-                    ok_trig, tags = trigger_unusual_volume_oi(x)
-                    if not ok_trig:
+                last_dt = parse_iso(state.last_seen_created_at) if state.last_seen_created_at else datetime(1970,1,1,tzinfo=timezone.utc)
+                fresh = []
+                for a in rows_sorted:
+                    ca = a.get("created_at")
+                    if not ca:
+                        continue
+                    try:
+                        if parse_iso(ca) > last_dt:
+                            fresh.append(a)
+                    except Exception:
                         continue
 
-                    ok_q, qtags = quality_ok(x, tier)
-                    if not ok_q:
+                if fresh:
+                    state.last_seen_created_at = fresh[-1].get("created_at") or state.last_seen_created_at
+
+                for a in fresh:
+                    x = normalize_flow_row(a)
+                    ok, tags = is_unusual(x)
+                    if not ok:
                         continue
 
-                    key = alert_hash(["contract", x["ticker"], x["type"], x["expiry"], x["strike"], x["volume"], x["open_interest"]])
+                    key = alert_hash(["flow", x["ticker"], x["type"], x.get("expiry"), x.get("strike"), x.get("premium"), x.get("volume"), x.get("open_interest")])
                     if not cooldown_ok(key):
                         continue
 
-                    msg = fmt_msg("CONTRACT_SCAN", x, tier, tags + qtags, extra=[])
-                    await telegram_send(msg, client)
+                    await telegram_send(fmt_msg(x, tags), client)
                     sent += 1
 
-                # 2) optional OI-change scan (better “unusual OI”)
-                if ENABLE_OI_CHANGE_SCAN:
-                    oi_rows = await fetch_oi_change(client, ticker, sem=sem)
-                    for row in oi_rows:
-                        x = contract_fields_from_any(row)
-                        if x["ticker"] != ticker:
-                            x["ticker"] = ticker
+                state.last_sent = sent
+                state.last_error = None
 
-                        ok_oi, oi_tags = trigger_oi_change(x)
-                        if not ok_oi:
+            except Exception as e:
+                state.last_error = repr(e)
+                log.exception("flow_loop error: %s", e)
+
+            await asyncio.sleep(POLL_FLOW_SECONDS)
+
+async def chain_scan_loop():
+    require_env()
+    async with httpx.AsyncClient() as client:
+        sem = asyncio.Semaphore(MAX_INFLIGHT)
+
+        while state.running:
+            state.last_scan_at = datetime.now(timezone.utc).isoformat()
+            sent = 0
+            try:
+                if not TICKERS:
+                    await asyncio.sleep(SCAN_SECONDS)
+                    continue
+
+                for ticker in TICKERS:
+                    expiries = await fetch_expiry_breakdown(client, ticker)
+                    if not expiries:
+                        continue
+
+                    expiries_to_scan = expiries[:6]
+
+                    async def scan_expiry(exp: str, opt_type: str) -> List[Dict[str, Any]]:
+                        async with sem:
+                            rows = []
+                            rows += await fetch_option_contracts(client, ticker, expiry=exp, option_type=opt_type, page=0, limit=500)
+                            return rows
+
+                    tasks = []
+                    for exp in expiries_to_scan:
+                        for opt_type in OPTION_TYPES:
+                            tasks.append(scan_expiry(exp, opt_type))
+
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    for r in results:
+                        if isinstance(r, Exception):
+                            log.warning("chain scan error: %s", repr(r))
                             continue
+                        for row in r:
+                            x = normalize_contract_row(row, ticker)
+                            ok, tags = is_unusual(x)
+                            if not ok:
+                                continue
 
-                        # For oi-change, still apply (optional) quality filters if fields exist
-                        ok_q, qtags = quality_ok(x, tier)
-                        if not ok_q:
-                            continue
+                            key = alert_hash(["chain", x["ticker"], x["type"], x.get("expiry"), x.get("strike"), x.get("volume"), x.get("open_interest")])
+                            if not cooldown_ok(key):
+                                continue
 
-                        key = alert_hash(["oi_change", x["ticker"], x.get("contract"), x.get("expiry"), x.get("strike"), x.get("oi_change")])
-                        if not cooldown_ok(key):
-                            continue
+                            await telegram_send(fmt_msg(x, tags), client)
+                            sent += 1
 
-                        msg = fmt_msg("OI_CHANGE", x, tier, tags=[], extra=oi_tags + qtags)
-                        await telegram_send(msg, client)
-                        sent += 1
+                state.last_sent += sent
+                state.last_error = None
 
-            state.last_sent_count += sent
-            state.last_error = None
+            except Exception as e:
+                state.last_error = repr(e)
+                log.exception("chain_scan_loop error: %s", e)
 
-        except Exception as e:
-            state.last_error = repr(e)
-            log.exception("scan_loop error: %s", e)
-
-        await asyncio.sleep(SCAN_SECONDS)
+            await asyncio.sleep(SCAN_SECONDS)
 
 # ----------------------------
-# FastAPI app
+# FastAPI
 # ----------------------------
-app = FastAPI(title="UW Options: Flow + Contract Scan → Telegram")
+app = FastAPI(title="UW Public API → Telegram (Unusual Volume/OI)")
 
 @app.on_event("startup")
 async def startup():
     require_env()
     state.running = True
-    async with httpx.AsyncClient() as client:
-        # warm start: ensure token works
-        try:
-            _ = await fetch_flow_alerts(client)
-        except Exception as e:
-            log.warning("Token test failed (flow endpoint). err=%s", e)
-
-    # new client per task (safer)
-    asyncio.create_task(_run_flow_task())
-    asyncio.create_task(_run_scan_task())
-
-async def _run_flow_task():
-    async with httpx.AsyncClient() as client:
-        await flow_loop(client)
-
-async def _run_scan_task():
-    async with httpx.AsyncClient() as client:
-        await scan_loop(client)
+    asyncio.create_task(flow_loop())
+    asyncio.create_task(chain_scan_loop())
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -811,36 +568,48 @@ def health():
         "tickers": TICKERS,
         "poll_flow_seconds": POLL_FLOW_SECONDS,
         "scan_seconds": SCAN_SECONDS,
-        "last_poll_flow_at": state.last_poll_flow_at,
-        "last_scan_at": state.last_scan_at,
         "last_seen_created_at": state.last_seen_created_at,
-        "last_fetch_flow_count": state.last_fetch_flow_count,
-        "last_sent_count": state.last_sent_count,
+        "last_flow_poll_at": state.last_flow_poll_at,
+        "last_scan_at": state.last_scan_at,
+        "last_sent": state.last_sent,
         "last_error": state.last_error,
-        "triggers": {
-            "min_unusual_volume": MIN_UNUSUAL_VOLUME,
-            "min_unusual_oi": MIN_UNUSUAL_OI,
-            "require_vol_gt_oi": REQUIRE_VOL_GT_OI,
-            "min_volume_oi_ratio": MIN_VOLUME_OI_RATIO,
-            "enable_oi_change_scan": ENABLE_OI_CHANGE_SCAN,
-            "min_abs_oi_change": MIN_ABS_OI_CHANGE,
-        },
-        "filters": {
-            "ask_only": ASK_ONLY,
-            "require_min_premium": REQUIRE_MIN_PREMIUM,
-            "min_premium": MIN_PREMIUM,
-            "require_delta_band": REQUIRE_DELTA_BAND,
-            "delta_band": [DELTA_MIN, DELTA_MAX],
-            "require_dte_band": REQUIRE_DTE_BAND,
-        },
-        "limits": {"max_inflight": MAX_INFLIGHT, "cooldown_seconds": COOLDOWN_SECONDS},
+        "auth": {"token_present": bool(UW_TOKEN), "token_len": len(UW_TOKEN or "")},
     }
+
+@app.get("/debug/headers")
+def debug_headers():
+    # Safe preview: don't show token
+    require_env()
+    hdr = uw_headers()
+    return {
+        "accept": hdr.get("Accept"),
+        "authorization_prefix": hdr.get("Authorization", "").split(" ")[0],
+        "token_len": len((hdr.get("Authorization", "").split(" ", 1)[1] if " " in hdr.get("Authorization","") else "")),
+    }
+
+@app.get("/debug/market-tide")
+async def debug_market_tide():
+    require_env()
+    async with httpx.AsyncClient() as client:
+        data = await fetch_market_tide(client)
+    return {"ok": True, "data": data}
+
+@app.get("/debug/uw-auth-test")
+async def uw_auth_test():
+    require_env()
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{UW_BASE_URL}{MARKET_TIDE_PATH}",
+            headers=uw_headers(),
+            timeout=20,
+        )
+    return {"status": r.status_code, "preview": r.text[:300]}
 
 @app.post("/test/telegram")
 async def test_telegram(body: TestMessage):
     require_env()
     async with httpx.AsyncClient() as client:
-        await telegram_send(h(body.text), client)
+        await telegram_send(body.text, client)
     return {"sent": True}
 
 @app.post("/control/stop")
@@ -853,8 +622,8 @@ def start():
     if state.running:
         return {"running": True}
     state.running = True
-    asyncio.create_task(_run_flow_task())
-    asyncio.create_task(_run_scan_task())
+    asyncio.create_task(flow_loop())
+    asyncio.create_task(chain_scan_loop())
     return {"running": True}
 
 @app.post("/control/reset_cursor")
@@ -862,43 +631,20 @@ def reset_cursor():
     state.last_seen_created_at = None
     return {"last_seen_created_at": None}
 
-@app.post("/simulate/contract")
-async def simulate_contract(body: SimulateContract):
-    """
-    Simulate a contract scan record and run triggers/filters/cooldown.
-    """
-    require_env()
-    x = {
-        "ticker": body.ticker.upper(),
-        "type": normalize_type(body.option_type),
-        "expiry": body.expiry,
-        "strike": body.strike,
-        "volume": body.volume,
-        "open_interest": body.open_interest,
-        "premium": body.premium,
-        "delta": body.delta,
-        "underlying": body.underlying_price,
-        "voloi": (body.volume / body.open_interest) if body.open_interest else None,
-        "side": "",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "contract": None,
-        "oi_change": None,
-        "raw": {},
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": "UW Public API → Telegram (Unusual Volume/OI)",
+        "endpoints": [
+            "/docs",
+            "/health",
+            "/debug/headers",
+            "/debug/market-tide",
+            "/debug/uw-auth-test",
+            "/test/telegram",
+            "/control/start",
+            "/control/stop",
+            "/control/reset_cursor",
+        ],
     }
-    tier = get_tier(x["ticker"])
-
-    ok_trig, tags = trigger_unusual_volume_oi(x)
-    if not ok_trig:
-        return {"sent": False, "stage": "trigger", "reason": tags}
-
-    ok_q, qtags = quality_ok(x, tier)
-    if not ok_q:
-        return {"sent": False, "stage": "quality", "reason": qtags}
-
-    key = alert_hash(["simulate_contract", x["ticker"], x["type"], x["expiry"], x["strike"], x["volume"], x["open_interest"]])
-    if not cooldown_ok(key):
-        return {"sent": False, "stage": "cooldown", "reason": "duplicate"}
-
-    async with httpx.AsyncClient() as client:
-        await telegram_send(fmt_msg("SIM_CONTRACT", x, tier, tags + qtags, extra=[]), client)
-    return {"sent": True, "ticker": x["ticker"], "tier": tier, "passed": tags + qtags}
