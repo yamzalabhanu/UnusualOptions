@@ -331,7 +331,6 @@ async def send_via_gpt_formatter(raw_text: str, client: httpx.AsyncClient) -> No
         if GPT_FORMATTER_FALLBACK_DIRECT:
             await telegram_send(raw_text, client)
         return
-return
 
 # ----------------------------
 # API clients
