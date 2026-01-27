@@ -27,7 +27,6 @@ import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
 import re
-import logging
 from openai import OpenAI
 
 
@@ -185,9 +184,84 @@ async def telegram_send(text: str, client: httpx.AsyncClient) -> None:
     }
     r = await client.post(url, json=payload, timeout=20)
     r.raise_for_status()
-    def require_openai_env() -> None:
+# ----------------------------
+# GPT Formatter (top-level)
+# ----------------------------
+def require_openai_env() -> None:
     if not OPENAI_API_KEY:
         raise RuntimeError("Missing env var: OPENAI_API_KEY")
+
+
+def sanitize_for_prompt(text: str) -> str:
+    text = (text or "").strip()
+    text = re.sub(r"\n{4,}", "\n\n", text)
+    return text[:12000]
+
+
+def strip_markdown_risky(text: str) -> str:
+    if not text:
+        return text
+    # avoid triple backticks which can break Telegram Markdown
+    return text.replace("```", "`")
+
+
+def formatter_instructions() -> str:
+    return (
+        "Rewrite stock/options alerts into a user-readable, accurate, actionable summary.\n"
+        "Rules:\n"
+        "- ONLY use facts present in the input alert text. Do NOT invent numbers, news, levels, targets, or catalysts.\n"
+        "- If a field is missing (e.g., delta), say 'unknown' (do not guess).\n"
+        "- Keep it short: 6–12 lines.\n"
+        "- Use Telegram-friendly Markdown. No code blocks.\n"
+        "- Highlight: ticker, alert type (Flow/Chain), direction (CALL/PUT), contract, premium, vol, OI, vol/OI, score, side, rule.\n"
+        "- Include a 'Risk notes' section with max 2 bullets.\n"
+    )
+
+
+async def gpt_rewrite_alert(raw_text: str) -> str:
+    require_openai_env()
+    if _openai_client is None:
+        raise RuntimeError("OpenAI client not initialized")
+
+    resp = _openai_client.responses.create(
+        model=OPENAI_MODEL,
+        reasoning={"effort": OPENAI_REASONING_EFFORT},
+        instructions=formatter_instructions(),
+        input=f"Rewrite this alert:\n\n{sanitize_for_prompt(raw_text)}",
+        max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+    )
+
+    out = getattr(resp, "output_text", "") or ""
+    out = strip_markdown_risky(out.strip())
+
+    return ("🧠 *GPT Summary*\n" + out) if out else raw_text
+
+
+def _local_formatter_url() -> str:
+    port = os.getenv("PORT", "8000")
+    return f"http://127.0.0.1:{port}/format-and-send"
+
+
+async def send_via_gpt_formatter(raw_text: str, client: httpx.AsyncClient) -> None:
+    """
+    Forwards raw text to local formatter endpoint in THIS SAME service.
+    That endpoint does GPT formatting + Telegram send.
+    """
+    url = GPT_FORMATTER_URL or _local_formatter_url()
+
+    try:
+        r = await client.post(
+            url,
+            json={"raw_text": raw_text, "send_to_telegram": True},
+            timeout=GPT_FORMATTER_TIMEOUT,
+        )
+        r.raise_for_status()
+        return
+    except Exception as e:
+        log.warning("GPT formatter failed: %s", repr(e))
+        if GPT_FORMATTER_FALLBACK_DIRECT:
+            await telegram_send(raw_text, client)
+
 
 def sanitize_for_prompt(text: str) -> str:
     text = (text or "").strip()
