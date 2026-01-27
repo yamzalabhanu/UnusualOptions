@@ -15,4 +15,6 @@ openai
 router
 ib-insync>=0.9.86
 oauthlib>=3.2.2
+openai>=1.0.0
+
 
