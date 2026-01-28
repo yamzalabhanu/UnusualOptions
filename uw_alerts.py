@@ -1,32 +1,27 @@
-# uw_alerts.py
-import asyncio
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from chatgpt import send_via_gpt_formatter
 from uw_core import (
     WATCHLIST, DEFAULT_WATCHLIST,
-    FLOW_POLL_SECONDS, CHAIN_POLL_SECONDS,
+    FLOW_POLL_SECONDS, CHAIN_POLL_SECONDS, ALERTS_POLL_SECONDS,
     MIN_FLOW_PREMIUM, MIN_FLOW_VOL_OI_RATIO, FLOW_ASK_ONLY, FLOW_LIMIT,
-    MIN_HARD_VOLUME, MIN_HARD_OI,
-    MIN_SCORE_TO_ALERT,
-    CHAIN_VOL_OI_RATIO, CHAIN_MIN_PREMIUM, CHAIN_MIN_OI_CHANGE, CHAIN_VOL_GREATER_OI_ONLY,
-    CHAIN_MIN_VOLUME, CHAIN_MIN_OI,
-    GPT_CHAIN_MIN_PREMIUM, GPT_CHAIN_MIN_VOLOI, GPT_CHAIN_MIN_OI_CHANGE,
-    CHAIN_TOP_N,
-    state, now_utc, parse_iso, safe_float, safe_int, money,
-    uw_get,
-    get_market_tide, get_darkpool_for_ticker,
-    summarize_market_tide, summarize_darkpool,
-    stable_fingerprint,
-    dedupe_event_check, dedupe_event_mark,
-    contract_check, contract_mark,
-    cooldown_ok,
+    CHAIN_VOL_OI_RATIO, CHAIN_MIN_VOLUME, CHAIN_MIN_OI, CHAIN_MIN_PREMIUM, CHAIN_MIN_OI_CHANGE, CHAIN_VOL_GREATER_OI_ONLY,
+    MIN_HARD_VOLUME, MIN_HARD_OI, MIN_SCORE_TO_ALERT, COOLDOWN_SECONDS, ENABLE_CUSTOM_ALERTS_FEED,
+    state, now_utc, parse_iso, safe_float, safe_int, money, sha16,
+    uw_get, get_market_tide, get_darkpool_for_ticker, summarize_market_tide, summarize_darkpool,
+    cooldown_ok, dedupe_event, suppress_contract, stable_fingerprint, market_hours_ok_now
 )
+from chatgpt import send_via_gpt_formatter, telegram_send
+
+import asyncio
+import logging
+log = logging.getLogger("uw_app.handlers")
+
 
 # ----------------------------
-# Flow parsing / scoring
+# Flow helpers
 # ----------------------------
 def get_flow_fields(a: Dict[str, Any]) -> Dict[str, Any]:
     return {
@@ -99,9 +94,27 @@ async def fetch_flow_alerts(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     return rows if isinstance(rows, list) else []
 
 
+def flow_alert_key(f: Dict[str, Any]) -> str:
+    raw = "|".join([
+        f.get("ticker", ""),
+        str(f.get("opt_type", "")),
+        str(f.get("strike", "")),
+        str(f.get("expiry", "")),
+        str(f.get("premium", "")),
+        str(f.get("created_at", "")),
+        str(f.get("contract", "")),
+    ])
+    return sha16(raw)
+
+
 async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> None:
+    # MARKET HOURS GATE
+    if not market_hours_ok_now():
+        return
+
     f = get_flow_fields(a)
 
+    # HARD GATES
     vol = f.get("volume") or 0
     oi = f.get("oi") or 0
     if vol < MIN_HARD_VOLUME or oi < MIN_HARD_OI:
@@ -112,23 +125,29 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
         return
 
     contract = f.get("contract") or ""
-    if not contract_check(contract):
+
+    # CROSS-STREAM suppression (Flow vs Chain)
+    if not suppress_contract(contract):
         return
 
+    # STABLE dedupe fingerprint (do NOT include created_at; bucket premium)
     fp = stable_fingerprint([
         "FLOW",
         f.get("ticker", ""),
         f.get("opt_type", ""),
         contract,
-        str(int((f.get("premium") or 0) / 1000)),
+        str(int((f.get("premium") or 0) / 1000)),  # premium bucket $1k
         str(f.get("side") or ""),
         str(f.get("rule") or ""),
+        str(f.get("strike") or ""),
+        str(f.get("expiry") or ""),
     ])
-    event_key = "evt:" + fp
-    if not dedupe_event_check(event_key):
+    if not dedupe_event("evt:" + fp):
         return
 
-    if not cooldown_ok("flow:" + event_key):
+    # COOLDOWN (extra)
+    key = "flow:" + flow_alert_key(f)
+    if not cooldown_ok(key):
         return
 
     ticker = f["ticker"]
@@ -147,12 +166,13 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
     ]
 
     await send_via_gpt_formatter("\n".join(lines), client)
-    contract_mark(contract)
-    dedupe_event_mark(event_key)
+
+    if f.get("created_at"):
+        state.flow_newer_than = f["created_at"]
 
 
 # ----------------------------
-# Chains
+# Chain scanner
 # ----------------------------
 def chain_row_fields(r: Dict[str, Any]) -> Dict[str, Any]:
     return {
@@ -163,10 +183,10 @@ def chain_row_fields(r: Dict[str, Any]) -> Dict[str, Any]:
         "total_premium": safe_float(r.get("total_premium") or r.get("premium") or r.get("notional")),
         "avg_price": safe_float(r.get("avg_price")),
         "iv": safe_float(r.get("implied_volatility")),
-        "sweep_volume": safe_int(r.get("sweep_volume")),
-        "multi_leg_volume": safe_int(r.get("multi_leg_volume")),
         "ask_volume": safe_int(r.get("ask_volume")),
         "bid_volume": safe_int(r.get("bid_volume")),
+        "sweep_volume": safe_int(r.get("sweep_volume")),
+        "multi_leg_volume": safe_int(r.get("multi_leg_volume")),
     }
 
 
@@ -176,6 +196,7 @@ def chain_is_unusual(f: Dict[str, Any]) -> Tuple[bool, List[str]]:
     prev_oi = f.get("prev_oi")
     prem = f.get("total_premium") or 0.0
 
+    # HARD GATES FIRST
     if vol < MIN_HARD_VOLUME:
         return False, [f"hard_vol<{MIN_HARD_VOLUME}"]
     if oi < MIN_HARD_OI:
@@ -188,6 +209,7 @@ def chain_is_unusual(f: Dict[str, Any]) -> Tuple[bool, List[str]]:
         return False, ["need_vol>oi"]
 
     reasons: List[str] = []
+
     if prem >= CHAIN_MIN_PREMIUM:
         reasons.append(f"prem>={int(CHAIN_MIN_PREMIUM)}")
     if voloi is not None and voloi >= CHAIN_VOL_OI_RATIO:
@@ -195,14 +217,14 @@ def chain_is_unusual(f: Dict[str, Any]) -> Tuple[bool, List[str]]:
     if oi_chg is not None and abs(oi_chg) >= CHAIN_MIN_OI_CHANGE:
         reasons.append(f"oi_chg>={CHAIN_MIN_OI_CHANGE}")
 
-    # info-only
+    # legacy info
     if vol >= CHAIN_MIN_VOLUME:
         reasons.append(f"vol>={CHAIN_MIN_VOLUME}")
     if oi >= CHAIN_MIN_OI:
         reasons.append(f"oi>={CHAIN_MIN_OI}")
 
-    real = [r for r in reasons if r.startswith(("prem>=", "vol/oi>=", "oi_chg>="))]
-    return (len(real) > 0), reasons
+    real_triggers = [r for r in reasons if r.startswith("prem>=") or r.startswith("vol/oi>=") or r.startswith("oi_chg>=")]
+    return (len(real_triggers) > 0), reasons
 
 
 async def fetch_option_contracts(client: httpx.AsyncClient, ticker: str) -> List[Dict[str, Any]]:
@@ -220,6 +242,10 @@ async def fetch_option_contracts(client: httpx.AsyncClient, ticker: str) -> List
 
 
 async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str) -> None:
+    # MARKET HOURS GATE
+    if not market_hours_ok_now():
+        return
+
     try:
         rows = await fetch_option_contracts(client, ticker)
     except Exception:
@@ -238,18 +264,41 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         return
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    top = scored[:max(1, CHAIN_TOP_N)]
+    top = scored[:3]
 
     tide = await get_market_tide(client)
     dp = await get_darkpool_for_ticker(client, ticker)
 
     for prem, f, reasons in top:
         contract = f.get("option_symbol") or ""
-        unique = f"chain:{ticker}:{contract}"
+        if not contract:
+            continue
 
+        # CROSS-STREAM suppression
+        if not suppress_contract(contract):
+            continue
+
+        # Stable fingerprint (no time, no ordering sensitivity)
+        fp = stable_fingerprint([
+            "CHAIN",
+            ticker,
+            contract,
+            str(int((prem or 0) / 1000)),
+            str(f.get("volume") or 0),
+            str(f.get("open_interest") or 0),
+        ])
+        if not dedupe_event("evt:" + fp):
+            continue
+
+        # cooldown: keep your existing per-contract cooldown too
+        unique = f"chain:{ticker}:{contract}"
         last = state.chain_seen.get(unique)
-        if last and (now_utc() - last).total_seconds() < 60:
-            # small per-contract local guard in addition to cooldown_ok
+        if last and (now_utc() - last).total_seconds() < COOLDOWN_SECONDS:
+            continue
+        state.chain_seen[unique] = now_utc()
+
+        key = "chain:" + sha16(unique + ":" + "|".join(sorted(reasons)))
+        if not cooldown_ok(key):
             continue
 
         vol = f.get("volume") or 0
@@ -257,38 +306,11 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         prev_oi = f.get("prev_oi")
         voloi = (vol / oi) if (oi > 0) else None
         oi_chg = (oi - prev_oi) if (prev_oi is not None) else None
-        prem_val = f.get("total_premium") or 0.0
-
-        strong = (
-            (prem_val >= GPT_CHAIN_MIN_PREMIUM) or
-            (voloi is not None and voloi >= GPT_CHAIN_MIN_VOLOI) or
-            (oi_chg is not None and abs(oi_chg) >= GPT_CHAIN_MIN_OI_CHANGE)
-        )
-        if not strong:
-            continue
-
-        if not contract_check(contract):
-            continue
-
-        fp = stable_fingerprint([
-            "CHAIN",
-            ticker,
-            contract,
-            str(int((prem_val or 0) / 1000)),
-            str(vol),
-            str(oi),
-        ])
-        event_key = "evt:" + fp
-        if not dedupe_event_check(event_key):
-            continue
-
-        if not cooldown_ok("chain:" + event_key):
-            continue
 
         lines = [
             f"🔥 *UW Unusual Chain* — *{ticker}*",
-            f"• Contract: `{contract or 'n/a'}`",
-            f"• Premium: *{money(prem_val)}* | AvgPx: `{f.get('avg_price')}` | IV: `{f.get('iv')}`",
+            f"• Contract: `{contract}`",
+            f"• Premium: *{money(prem)}* | AvgPx: `{f.get('avg_price')}` | IV: `{f.get('iv')}`",
             f"• Vol: `{vol}` | OI: `{oi}` | PrevOI: `{prev_oi}` | OIΔ: `{oi_chg}` | Vol/OI: `{voloi}`",
             f"• AskVol: `{f.get('ask_volume')}` | BidVol: `{f.get('bid_volume')}` | Sweeps: `{f.get('sweep_volume')}` | MultiLeg: `{f.get('multi_leg_volume')}`",
             f"• Triggers: `{', '.join(reasons)}`",
@@ -298,9 +320,60 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         ]
 
         await send_via_gpt_formatter("\n".join(lines), client)
-        state.chain_seen[unique] = now_utc()
-        contract_mark(contract)
-        dedupe_event_mark(event_key)
+
+
+# ----------------------------
+# Optional: Custom Alerts feed
+# ----------------------------
+async def fetch_custom_alerts(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
+    params: Dict[str, Any] = {"limit": 100}
+    if state.alerts_newer_than:
+        params["newer_than"] = state.alerts_newer_than
+    data = await uw_get(client, "/api/alerts", params=params)
+    rows = data.get("data") if isinstance(data, dict) else data
+    return rows if isinstance(rows, list) else []
+
+
+def alert_key(a: Dict[str, Any]) -> str:
+    raw = "|".join([
+        str(a.get("id") or ""),
+        str(a.get("name") or ""),
+        str(a.get("noti_type") or ""),
+        str(a.get("tape_time") or a.get("created_at") or ""),
+        str(a.get("symbol") or a.get("ticker") or ""),
+    ])
+    return sha16(raw)
+
+
+async def handle_custom_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> None:
+    if not market_hours_ok_now():
+        return
+
+    key = "alert:" + alert_key(a)
+    if not cooldown_ok(key):
+        return
+
+    # optional dedupe by fingerprint too
+    fp = stable_fingerprint(["CUSTOM", str(a.get("noti_type") or ""), str(a.get("symbol") or ""), str(a.get("id") or "")])
+    if not dedupe_event("evt:" + fp):
+        return
+
+    name = a.get("name") or "Custom Alert"
+    noti_type = a.get("noti_type") or "unknown"
+    sym = a.get("symbol") or a.get("ticker") or ""
+    ts = a.get("tape_time") or a.get("created_at") or ""
+
+    lines = [
+        f"🔔 *UW Custom Alert* — `{noti_type}`",
+        f"• Name: `{name}`",
+        f"• Symbol: `{sym}`",
+        f"• Payload: `{json.dumps(a)[:1500]}`",
+        f"• Time: `{ts}`",
+    ]
+    await telegram_send("\n".join(lines), client)
+
+    if ts:
+        state.alerts_newer_than = ts
 
 
 # ----------------------------
@@ -312,31 +385,13 @@ async def flow_loop():
             try:
                 rows = await fetch_flow_alerts(client)
 
-                # max cursor
-                max_dt: Optional[Any] = None
-                max_raw: Optional[str] = None
-                for x in rows:
-                    raw = str(x.get("created_at") or x.get("tape_time") or "")
-                    if not raw:
-                        continue
-                    dt = parse_iso(raw)
-                    if max_dt is None or dt > max_dt:
-                        max_dt = dt
-                        max_raw = raw
-
                 def _k(x: Dict[str, Any]):
-                    raw = str(x.get("created_at") or x.get("tape_time") or "1970-01-01T00:00:00+00:00")
-                    return parse_iso(raw)
+                    return parse_iso(str(x.get("created_at") or "1970-01-01T00:00:00+00:00"))
 
                 for a in sorted(rows, key=_k):
                     await handle_flow_alert(client, a)
-
-                if max_raw:
-                    state.flow_newer_than = max_raw
-
             except Exception:
                 pass
-
             await asyncio.sleep(FLOW_POLL_SECONDS)
 
 
@@ -350,3 +405,19 @@ async def chains_loop():
             except Exception:
                 pass
             await asyncio.sleep(CHAIN_POLL_SECONDS)
+
+
+async def custom_alerts_loop():
+    async with httpx.AsyncClient() as client:
+        while state.running:
+            try:
+                rows = await fetch_custom_alerts(client)
+
+                def _k(x: Dict[str, Any]):
+                    return parse_iso(str(x.get("tape_time") or x.get("created_at") or "1970-01-01T00:00:00+00:00"))
+
+                for a in sorted(rows, key=_k):
+                    await handle_custom_alert(client, a)
+            except Exception:
+                pass
+            await asyncio.sleep(ALERTS_POLL_SECONDS)
