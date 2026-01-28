@@ -43,8 +43,8 @@ CHAIN_MIN_OI_CHANGE = int(os.getenv("CHAIN_MIN_OI_CHANGE", "1500"))
 CHAIN_VOL_GREATER_OI_ONLY = os.getenv("CHAIN_VOL_GREATER_OI_ONLY", "0") == "1"
 
 # HARD GATES
-MIN_HARD_VOLUME = int(os.getenv("MIN_HARD_VOLUME", "10000"))
-MIN_HARD_OI = int(os.getenv("MIN_HARD_OI", "10000"))
+MIN_HARD_VOLUME = int(os.getenv("MIN_HARD_VOLUME", "5000"))
+MIN_HARD_OI = int(os.getenv("MIN_HARD_OI", "5000"))
 
 # Flow score gate
 MIN_SCORE_TO_ALERT = int(os.getenv("MIN_SCORE_TO_ALERT", "70"))
