@@ -1,18 +1,4 @@
-"""
-app.py — Unusual Whales (Public API) → Telegram
-
-Features:
-✅ HARD gates (Flow + Chain):
-   - Volume >= MIN_HARD_VOLUME
-   - OI     >= MIN_HARD_OI
-✅ Flow additionally requires:
-   - Score >= MIN_SCORE_TO_ALERT
-✅ Caches: market tide + darkpool
-✅ Chain triggers AFTER hard gates: premium / voloi / oi_change
-✅ Dedupe: stable event fingerprint + contract suppression (avoid duplicates across Flow + Chain)
-✅ GPT throttling: prevents OpenAI 429 spam
-"""
-
+# main.py
 import os
 import re
 import time
@@ -28,8 +14,8 @@ from collections import OrderedDict
 import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
-from openai import OpenAI
 
+from chatgpt import send_via_gpt_formatter, telegram_send, gpt_rewrite_alert
 
 # ----------------------------
 # ENV / CONFIG
@@ -67,7 +53,7 @@ MIN_HARD_OI = int(os.getenv("MIN_HARD_OI", "10000"))
 # Flow score gate
 MIN_SCORE_TO_ALERT = int(os.getenv("MIN_SCORE_TO_ALERT", "70"))
 
-# Cooldown (secondary, separate from dedupe)
+# Cooldown
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "600"))
 
 ENABLE_CUSTOM_ALERTS_FEED = os.getenv("ENABLE_CUSTOM_ALERTS_FEED", "0") == "1"
@@ -77,17 +63,6 @@ DEDUP_TTL_SECONDS = int(os.getenv("DEDUP_TTL_SECONDS", "1800"))  # 30 min
 DEDUP_MAX_KEYS = int(os.getenv("DEDUP_MAX_KEYS", "20000"))
 CROSS_STREAM_SUPPRESS_SECONDS = int(os.getenv("CROSS_STREAM_SUPPRESS_SECONDS", "1800"))
 
-# OpenAI GPT formatter
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5").strip()
-OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "low").strip()
-OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "350"))
-
-# GPT throttling
-GPT_MIN_SECONDS_BETWEEN_CALLS = float(os.getenv("GPT_MIN_SECONDS_BETWEEN_CALLS", "2.0"))
-GPT_MAX_CALLS_PER_MINUTE = int(os.getenv("GPT_MAX_CALLS_PER_MINUTE", "20"))
-GPT_DROP_WHEN_THROTTLED = os.getenv("GPT_DROP_WHEN_THROTTLED", "1") == "1"
-
 # Optional: only GPT-format chain alerts when "strong"
 GPT_CHAIN_MIN_PREMIUM = float(os.getenv("GPT_CHAIN_MIN_PREMIUM", "1000000"))
 GPT_CHAIN_MIN_VOLOI = float(os.getenv("GPT_CHAIN_MIN_VOLOI", "3.0"))
@@ -95,8 +70,6 @@ GPT_CHAIN_MIN_OI_CHANGE = int(os.getenv("GPT_CHAIN_MIN_OI_CHANGE", "5000"))
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 log = logging.getLogger("uw_app")
-
-_openai_client: Optional[OpenAI] = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 DEFAULT_WATCHLIST = [
     "NVDA", "AMD", "MSFT", "META", "AAPL", "TSLA", "AMZN", "GOOGL",
@@ -117,26 +90,16 @@ class CacheItem:
 class State:
     running: bool = False
 
-    # Cursors
     flow_newer_than: Optional[str] = None
     alerts_newer_than: Optional[str] = None
 
-    # Cooldown
     cooldown: Dict[str, datetime] = field(default_factory=dict)
 
-    # Caches
     market_tide_cache: Optional[CacheItem] = None
     darkpool_cache: Dict[str, CacheItem] = field(default_factory=dict)
 
-    # Chain quick dedupe
     chain_seen: Dict[str, datetime] = field(default_factory=dict)
 
-    # GPT rate-limit state
-    gpt_last_call_at: Optional[datetime] = None
-    gpt_window_start: Optional[datetime] = None
-    gpt_calls_in_window: int = 0
-
-    # Robust dedupe
     sent_cache: "OrderedDict[str, float]" = field(default_factory=OrderedDict)
     sent_contract_cache: "OrderedDict[str, float]" = field(default_factory=OrderedDict)
 
@@ -216,10 +179,8 @@ def cooldown_ok(key: str) -> bool:
     last = state.cooldown.get(key)
     if last and (now - last).total_seconds() < COOLDOWN_SECONDS:
         return False
-
     state.cooldown[key] = now
 
-    # prune
     if len(state.cooldown) > 5000:
         cutoff = now - timedelta(seconds=COOLDOWN_SECONDS * 3)
         state.cooldown = {k: v for k, v in state.cooldown.items() if v >= cutoff}
@@ -227,7 +188,7 @@ def cooldown_ok(key: str) -> bool:
 
 
 # ----------------------------
-# Robust Dedupe (stable fingerprint + contract suppression)
+# Robust Dedupe
 # ----------------------------
 def _prune_ordered_cache(cache: "OrderedDict[str, float]", ttl: int, max_keys: int) -> None:
     now = time.time()
@@ -284,105 +245,6 @@ def contract_mark(contract: str) -> None:
     if not c:
         return
     _mark_seen(state.sent_contract_cache, c)
-
-
-# ----------------------------
-# Telegram
-# ----------------------------
-async def telegram_send(text: str, client: httpx.AsyncClient) -> None:
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True,
-    }
-    r = await client.post(url, json=payload, timeout=20)
-    r.raise_for_status()
-
-
-# ----------------------------
-# OpenAI / GPT formatting
-# ----------------------------
-def require_openai_env() -> None:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("Missing env var: OPENAI_API_KEY")
-
-
-def sanitize_for_prompt(text: str) -> str:
-    text = (text or "").strip()
-    text = re.sub(r"\n{4,}", "\n\n", text)
-    return text[:12000]
-
-
-def strip_markdown_risky(text: str) -> str:
-    return (text or "").replace("```", "`")
-
-
-def formatter_instructions() -> str:
-    return (
-        "Rewrite stock/options alerts into a user-readable, accurate, actionable summary.\n"
-        "Rules:\n"
-        "- ONLY use facts present in the input alert text. Do NOT invent numbers, news, levels, targets, or catalysts.\n"
-        "- If a field is missing (e.g., delta), say 'unknown' (do not guess).\n"
-        "- Keep it short: 6–12 lines.\n"
-        "- Use Telegram-friendly Markdown. No code blocks.\n"
-        "- Highlight: ticker, alert type (Flow/Chain), direction (CALL/PUT), contract, premium, vol, OI, vol/OI, score, side, rule.\n"
-        "- Include a 'Risk notes' section with max 2 bullets.\n"
-    )
-
-
-async def gpt_rewrite_alert(raw_text: str) -> str:
-    require_openai_env()
-    if _openai_client is None:
-        raise RuntimeError("OpenAI client not initialized")
-
-    resp = _openai_client.responses.create(
-        model=OPENAI_MODEL,
-        reasoning={"effort": OPENAI_REASONING_EFFORT},
-        instructions=formatter_instructions(),
-        input=f"Rewrite this alert:\n\n{sanitize_for_prompt(raw_text)}",
-        max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
-    )
-
-    out = getattr(resp, "output_text", "") or ""
-    out = strip_markdown_risky(out.strip())
-    return ("🧠 *GPT Summary*\n" + out) if out else raw_text
-
-
-def _gpt_allow_call() -> bool:
-    now = now_utc()
-
-    if state.gpt_last_call_at is not None:
-        if (now - state.gpt_last_call_at).total_seconds() < GPT_MIN_SECONDS_BETWEEN_CALLS:
-            return False
-
-    if state.gpt_window_start is None or (now - state.gpt_window_start).total_seconds() >= 60:
-        state.gpt_window_start = now
-        state.gpt_calls_in_window = 0
-
-    if state.gpt_calls_in_window >= GPT_MAX_CALLS_PER_MINUTE:
-        return False
-
-    state.gpt_last_call_at = now
-    state.gpt_calls_in_window += 1
-    return True
-
-
-async def send_via_gpt_formatter(raw_text: str, client: httpx.AsyncClient) -> None:
-    """
-    Formats via OpenAI and sends to Telegram.
-    Throttled to avoid OpenAI 429 spam.
-    """
-    if not _gpt_allow_call():
-        if GPT_DROP_WHEN_THROTTLED:
-            log.info("GPT throttled: dropping alert")
-            return
-        await telegram_send(raw_text, client)
-        return
-
-    formatted = await gpt_rewrite_alert(raw_text)
-    await telegram_send(formatted, client)
 
 
 # ----------------------------
@@ -557,7 +419,7 @@ async def fetch_flow_alerts(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
 async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> None:
     f = get_flow_fields(a)
 
-    # HARD GATES FIRST
+    # HARD GATES
     vol = f.get("volume") or 0
     oi = f.get("oi") or 0
     if vol < MIN_HARD_VOLUME or oi < MIN_HARD_OI:
@@ -576,7 +438,7 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
         f.get("ticker", ""),
         f.get("opt_type", ""),
         contract,
-        str(int((f.get("premium") or 0) / 1000)),  # bucket $1k
+        str(int((f.get("premium") or 0) / 1000)),
         str(f.get("side") or ""),
         str(f.get("rule") or ""),
     ])
@@ -584,7 +446,6 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
     if not dedupe_event_check(event_key):
         return
 
-    # Secondary cooldown
     if not cooldown_ok("flow:" + event_key):
         return
 
@@ -603,7 +464,6 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
         f"• Time: `{f.get('created_at')}`",
     ]
 
-    # SEND (mark dedupe only after successful send)
     await send_via_gpt_formatter("\n".join(lines), client)
     contract_mark(contract)
     dedupe_event_mark(event_key)
@@ -636,7 +496,6 @@ def chain_is_unusual(f: Dict[str, Any]) -> Tuple[bool, List[str]]:
     prev_oi = f.get("prev_oi")
     prem = f.get("total_premium") or 0.0
 
-    # HARD GATES
     if vol < MIN_HARD_VOLUME:
         return False, [f"hard_vol<{MIN_HARD_VOLUME}"]
     if oi < MIN_HARD_OI:
@@ -649,8 +508,6 @@ def chain_is_unusual(f: Dict[str, Any]) -> Tuple[bool, List[str]]:
         return False, ["need_vol>oi"]
 
     reasons: List[str] = []
-
-    # triggers AFTER hard gates
     if prem >= CHAIN_MIN_PREMIUM:
         reasons.append(f"prem>={int(CHAIN_MIN_PREMIUM)}")
     if voloi is not None and voloi >= CHAIN_VOL_OI_RATIO:
@@ -658,7 +515,6 @@ def chain_is_unusual(f: Dict[str, Any]) -> Tuple[bool, List[str]]:
     if oi_chg is not None and abs(oi_chg) >= CHAIN_MIN_OI_CHANGE:
         reasons.append(f"oi_chg>={CHAIN_MIN_OI_CHANGE}")
 
-    # info-only
     if vol >= CHAIN_MIN_VOLUME:
         reasons.append(f"vol>={CHAIN_MIN_VOLUME}")
     if oi >= CHAIN_MIN_OI:
@@ -710,12 +566,10 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         contract = f.get("option_symbol") or ""
         unique = f"chain:{ticker}:{contract}"
 
-        # quick per-contract cooldown
         last = state.chain_seen.get(unique)
         if last and (now_utc() - last).total_seconds() < COOLDOWN_SECONDS:
             continue
 
-        # strong gating for GPT spend
         vol = f.get("volume") or 0
         oi = f.get("open_interest") or 0
         prev_oi = f.get("prev_oi")
@@ -731,11 +585,9 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         if not strong:
             continue
 
-        # cross-stream suppression
         if not contract_check(contract):
             continue
 
-        # stable event fingerprint
         fp = stable_fingerprint([
             "CHAIN",
             ticker,
@@ -770,54 +622,6 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
 
 
 # ----------------------------
-# Optional: Custom alerts feed (/api/alerts)
-# ----------------------------
-async def fetch_custom_alerts(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    params: Dict[str, Any] = {"limit": 100}
-    if state.alerts_newer_than:
-        params["newer_than"] = state.alerts_newer_than
-    data = await uw_get(client, "/api/alerts", params=params)
-    rows = data.get("data") if isinstance(data, dict) else data
-    return rows if isinstance(rows, list) else []
-
-
-def alert_key(a: Dict[str, Any]) -> str:
-    raw = "|".join([
-        str(a.get("id") or ""),
-        str(a.get("name") or ""),
-        str(a.get("noti_type") or ""),
-        str(a.get("tape_time") or a.get("created_at") or ""),
-        str(a.get("symbol") or a.get("ticker") or ""),
-    ])
-    return sha16(raw)
-
-
-async def handle_custom_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> None:
-    key = "alert:" + alert_key(a)
-    if not cooldown_ok(key):
-        return
-
-    name = a.get("name") or "Custom Alert"
-    noti_type = a.get("noti_type") or "unknown"
-    sym = a.get("symbol") or a.get("ticker") or ""
-    ts = a.get("tape_time") or a.get("created_at") or ""
-
-    # avoid triple backticks in Telegram Markdown mode
-    payload_short = json.dumps(a, indent=2)[:1500].replace("```", "`")
-
-    lines = [
-        f"🔔 *UW Custom Alert* — `{noti_type}`",
-        f"• Name: `{name}`",
-        f"• Symbol: `{sym}`",
-        f"• Payload: `{payload_short}`",
-        f"• Time: `{ts}`",
-    ]
-    await telegram_send("\n".join(lines), client)
-    if ts:
-        state.alerts_newer_than = ts
-
-
-# ----------------------------
 # Background loops
 # ----------------------------
 async def flow_loop():
@@ -826,7 +630,7 @@ async def flow_loop():
             try:
                 rows = await fetch_flow_alerts(client)
 
-                # advance cursor to max created_at seen (prevents repeated pulls)
+                # cursor = max created_at in batch
                 max_dt: Optional[datetime] = None
                 max_raw: Optional[str] = None
                 for x in rows:
@@ -866,25 +670,8 @@ async def chains_loop():
             await asyncio.sleep(CHAIN_POLL_SECONDS)
 
 
-async def custom_alerts_loop():
-    async with httpx.AsyncClient() as client:
-        while state.running:
-            try:
-                rows = await fetch_custom_alerts(client)
-
-                def _k(x: Dict[str, Any]) -> datetime:
-                    raw = str(x.get("tape_time") or x.get("created_at") or "1970-01-01T00:00:00+00:00")
-                    return parse_iso(raw)
-
-                for a in sorted(rows, key=_k):
-                    await handle_custom_alert(client, a)
-            except Exception:
-                pass
-            await asyncio.sleep(ALERTS_POLL_SECONDS)
-
-
 # ----------------------------
-# FastAPI app
+# FastAPI
 # ----------------------------
 app = FastAPI(title="Unusual Whales Public API → Telegram (Flow + Unusual Chains + Market Tide)")
 
@@ -894,14 +681,10 @@ async def startup():
     state.running = True
     asyncio.create_task(flow_loop())
     asyncio.create_task(chains_loop())
-    if ENABLE_CUSTOM_ALERTS_FEED:
-        asyncio.create_task(custom_alerts_loop())
-
 
 @app.on_event("shutdown")
 async def shutdown():
     state.running = False
-
 
 @app.get("/health")
 def health():
@@ -934,85 +717,8 @@ def health():
             "dedup_ttl_seconds": DEDUP_TTL_SECONDS,
             "cross_stream_suppress_seconds": CROSS_STREAM_SUPPRESS_SECONDS,
         },
-        "gpt_throttle": {
-            "min_seconds_between_calls": GPT_MIN_SECONDS_BETWEEN_CALLS,
-            "max_calls_per_minute": GPT_MAX_CALLS_PER_MINUTE,
-            "drop_when_throttled": GPT_DROP_WHEN_THROTTLED,
-        },
         "cooldown_seconds": COOLDOWN_SECONDS,
-        "custom_alerts_feed_enabled": ENABLE_CUSTOM_ALERTS_FEED,
     }
-
-
-@app.get("/debug/market-tide")
-async def debug_market_tide():
-    require_env()
-    async with httpx.AsyncClient() as client:
-        tide = await get_market_tide(client)
-    return {"tide": tide}
-
-
-@app.get("/debug/darkpool/{ticker}")
-async def debug_darkpool(ticker: str):
-    require_env()
-    t = ticker.upper()
-    async with httpx.AsyncClient() as client:
-        dp = await get_darkpool_for_ticker(client, t)
-    return {"ticker": t, "darkpool": dp}
-
-
-@app.get("/debug/flow-alerts")
-async def debug_flow_alerts():
-    require_env()
-    async with httpx.AsyncClient() as client:
-        rows = await fetch_flow_alerts(client)
-    return {"count": len(rows), "sample": rows[:3]}
-
-
-@app.get("/debug/option-contracts/{ticker}")
-async def debug_option_contracts(ticker: str):
-    require_env()
-    t = ticker.upper()
-    async with httpx.AsyncClient() as client:
-        rows = await fetch_option_contracts(client, t)
-    return {"ticker": t, "count": len(rows), "sample": rows[:3]}
-
-
-class TestMessage(BaseModel):
-    text: str
-
-
-@app.post("/test/telegram")
-async def test_telegram(body: TestMessage):
-    require_env()
-    async with httpx.AsyncClient() as client:
-        await send_via_gpt_formatter(body.text, client)
-    return {"sent": True}
-
-
-@app.post("/control/stop")
-def stop():
-    state.running = False
-    return {"running": state.running}
-
-
-@app.post("/control/start")
-def start():
-    if state.running:
-        return {"running": True}
-    state.running = True
-    asyncio.create_task(flow_loop())
-    asyncio.create_task(chains_loop())
-    if ENABLE_CUSTOM_ALERTS_FEED:
-        asyncio.create_task(custom_alerts_loop())
-    return {"running": True}
-
-
-@app.post("/control/reset_cursors")
-def reset_cursors():
-    state.flow_newer_than = None
-    state.alerts_newer_than = None
-    return {"flow_newer_than": None, "alerts_newer_than": None}
 
 
 class InboundAlert(BaseModel):
@@ -1048,9 +754,6 @@ def root():
         "endpoints": [
             "/docs", "/health",
             "/format", "/format-and-send",
-            "/debug/market-tide", "/debug/darkpool/{ticker}",
-            "/debug/flow-alerts", "/debug/option-contracts/{ticker}",
-            "/test/telegram",
             "/control/start", "/control/stop", "/control/reset_cursors",
         ],
     }
