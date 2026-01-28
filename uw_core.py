@@ -1,31 +1,36 @@
-# uw_core.py
 import os
-import time
-import json
+import asyncio
 import hashlib
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, List, Optional, Tuple
 from collections import OrderedDict
 
 import httpx
+from zoneinfo import ZoneInfo
 
-log = logging.getLogger("uw_app")
+# ----------------------------
+# LOG
+# ----------------------------
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+log = logging.getLogger("uw_app.core")
 
 # ----------------------------
 # ENV / CONFIG
 # ----------------------------
 UW_BASE_URL = os.getenv("UW_BASE_URL", "https://api.unusualwhales.com").rstrip("/")
-UW_TOKEN = os.getenv("UW_TOKEN", "").strip()
+UW_TOKEN = (os.getenv("UW_TOKEN", "") or "").replace("\n", "").replace("\r", "").strip()
 
-TG_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TG_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN", "") or "").strip()
+TG_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID", "") or "").strip()
 
 WATCHLIST = [t.strip().upper() for t in os.getenv("TICKERS", "").split(",") if t.strip()]
 
 FLOW_POLL_SECONDS = int(os.getenv("FLOW_POLL_SECONDS", "10"))
 CHAIN_POLL_SECONDS = int(os.getenv("CHAIN_POLL_SECONDS", "60"))
+ALERTS_POLL_SECONDS = int(os.getenv("ALERTS_POLL_SECONDS", "30"))
 
 MARKET_TIDE_CACHE_SECONDS = int(os.getenv("MARKET_TIDE_CACHE_SECONDS", "45"))
 DARKPOOL_CACHE_SECONDS = int(os.getenv("DARKPOOL_CACHE_SECONDS", "300"))
@@ -36,77 +41,39 @@ FLOW_ASK_ONLY = os.getenv("FLOW_ASK_ONLY", "1").strip() == "1"
 FLOW_LIMIT = int(os.getenv("FLOW_LIMIT", "200"))
 
 CHAIN_VOL_OI_RATIO = float(os.getenv("CHAIN_VOL_OI_RATIO", "2.0"))
-CHAIN_MIN_VOLUME = int(os.getenv("CHAIN_MIN_VOLUME", "2500"))  # info-only
-CHAIN_MIN_OI = int(os.getenv("CHAIN_MIN_OI", "5000"))          # info-only
+CHAIN_MIN_VOLUME = int(os.getenv("CHAIN_MIN_VOLUME", "2500"))
+CHAIN_MIN_OI = int(os.getenv("CHAIN_MIN_OI", "5000"))
 CHAIN_MIN_PREMIUM = float(os.getenv("CHAIN_MIN_PREMIUM", "200000"))
 CHAIN_MIN_OI_CHANGE = int(os.getenv("CHAIN_MIN_OI_CHANGE", "1500"))
 CHAIN_VOL_GREATER_OI_ONLY = os.getenv("CHAIN_VOL_GREATER_OI_ONLY", "0") == "1"
 
 # HARD GATES
-MIN_HARD_VOLUME = int(os.getenv("MIN_HARD_VOLUME", "5000"))
-MIN_HARD_OI = int(os.getenv("MIN_HARD_OI", "5000"))
+MIN_HARD_VOLUME = int(os.getenv("MIN_HARD_VOLUME", "10000"))
+MIN_HARD_OI = int(os.getenv("MIN_HARD_OI", "10000"))
 
 # Flow score gate
 MIN_SCORE_TO_ALERT = int(os.getenv("MIN_SCORE_TO_ALERT", "70"))
 
-# Cooldown
+# Cooldown / dedupe
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "600"))
-
-# Dedupe tuning
-DEDUP_TTL_SECONDS = int(os.getenv("DEDUP_TTL_SECONDS", "1800"))
+DEDUP_TTL_SECONDS = int(os.getenv("DEDUP_TTL_SECONDS", "1800"))  # 30 min
 DEDUP_MAX_KEYS = int(os.getenv("DEDUP_MAX_KEYS", "20000"))
 CROSS_STREAM_SUPPRESS_SECONDS = int(os.getenv("CROSS_STREAM_SUPPRESS_SECONDS", "1800"))
 
-# Chain GPT gating
-GPT_CHAIN_MIN_PREMIUM = float(os.getenv("GPT_CHAIN_MIN_PREMIUM", "1000000"))
-GPT_CHAIN_MIN_VOLOI = float(os.getenv("GPT_CHAIN_MIN_VOLOI", "3.0"))
-GPT_CHAIN_MIN_OI_CHANGE = int(os.getenv("GPT_CHAIN_MIN_OI_CHANGE", "5000"))
-
-# Limit chain alerts per ticker
-CHAIN_TOP_N = int(os.getenv("CHAIN_TOP_N", "1"))
+ENABLE_CUSTOM_ALERTS_FEED = os.getenv("ENABLE_CUSTOM_ALERTS_FEED", "0") == "1"
 
 DEFAULT_WATCHLIST = [
     "NVDA", "AMD", "MSFT", "META", "AAPL", "TSLA", "AMZN", "GOOGL",
     "PLTR", "CRWD", "SMCI", "MU", "ARM", "NFLX", "AVGO", "COIN", "MSTR"
 ]
 
+# Market hours window (Eastern)
+ET = ZoneInfo("America/New_York")
+MARKET_OPEN_HHMM = (9, 30)
+MARKET_CLOSE_HHMM = (16, 0)
 
 # ----------------------------
-# State
-# ----------------------------
-@dataclass
-class CacheItem:
-    value: Any
-    expires_at: datetime
-
-
-@dataclass
-class State:
-    running: bool = False
-
-    # Flow cursor (server param: newer_than)
-    flow_newer_than: Optional[str] = None
-
-    # cooldown for keys (flow/chain)
-    cooldown: Dict[str, datetime] = field(default_factory=dict)
-
-    # caches
-    market_tide_cache: Optional[CacheItem] = None
-    darkpool_cache: Dict[str, CacheItem] = field(default_factory=dict)
-
-    # chain contract cooldown
-    chain_seen: Dict[str, datetime] = field(default_factory=dict)
-
-    # dedupe
-    sent_cache: "OrderedDict[str, float]" = field(default_factory=OrderedDict)
-    sent_contract_cache: "OrderedDict[str, float]" = field(default_factory=OrderedDict)
-
-
-state = State()
-
-
-# ----------------------------
-# Generic helpers
+# Helpers
 # ----------------------------
 def require_env() -> None:
     missing = []
@@ -119,29 +86,46 @@ def require_env() -> None:
     if missing:
         raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
 
+    log.info("UW auth configured: token_present=%s token_len=%d", bool(UW_TOKEN), len(UW_TOKEN or ""))
+
 
 def bearerize(token: str) -> str:
     t = (token or "").strip()
     if not t:
         return ""
-    return t if t.lower().startswith("bearer ") else f"Bearer {t}"
+    if t.lower().startswith("bearer "):
+        return t
+    return f"Bearer {t}"
 
 
 def uw_headers() -> Dict[str, str]:
-    return {"Accept": "application/json", "Authorization": bearerize(UW_TOKEN)}
+    return {
+        "Accept": "application/json",
+        "Authorization": bearerize(UW_TOKEN),
+    }
 
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def parse_iso(dt_str: str) -> datetime:
-    if not dt_str:
-        return datetime(1970, 1, 1, tzinfo=timezone.utc)
-    s = str(dt_str).strip()
-    if s.endswith("Z"):
-        s = s.replace("Z", "+00:00")
-    return datetime.fromisoformat(s)
+def now_et() -> datetime:
+    return datetime.now(tz=ET)
+
+
+def market_hours_ok_now() -> bool:
+    """
+    True only during 9:30am–4:00pm ET, Mon–Fri.
+    NOTE: does NOT account for US market holidays/half-days.
+    """
+    t = now_et()
+    if t.weekday() >= 5:  # 5=Sat,6=Sun
+        return False
+    open_h, open_m = MARKET_OPEN_HHMM
+    close_h, close_m = MARKET_CLOSE_HHMM
+    start = t.replace(hour=open_h, minute=open_m, second=0, microsecond=0)
+    end = t.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
+    return start <= t <= end
 
 
 def safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
@@ -162,6 +146,15 @@ def safe_int(x: Any, default: Optional[int] = None) -> Optional[int]:
         return default
 
 
+def parse_iso(dt_str: str) -> datetime:
+    if not dt_str:
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+    s = str(dt_str).strip()
+    if s.endswith("Z"):
+        s = s.replace("Z", "+00:00")
+    return datetime.fromisoformat(s)
+
+
 def money(x: Optional[float]) -> str:
     if x is None:
         return "n/a"
@@ -172,34 +165,12 @@ def sha16(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
 
-# ----------------------------
-# Dedupe / suppression
-# ----------------------------
-def _prune_ordered_cache(cache: "OrderedDict[str, float]", ttl: int, max_keys: int) -> None:
-    now = time.time()
-    while cache:
-        _, ts = next(iter(cache.items()))
-        if (now - ts) <= ttl:
-            break
-        cache.popitem(last=False)
-    while len(cache) > max_keys:
-        cache.popitem(last=False)
-
-
-def _seen_recently(cache: "OrderedDict[str, float]", key: str, ttl: int) -> bool:
-    ts = cache.get(key)
-    if ts is None:
-        return False
-    return (time.time() - ts) <= ttl
-
-
-def _mark_seen(cache: "OrderedDict[str, float]", key: str) -> None:
-    cache[key] = time.time()
-    cache.move_to_end(key, last=True)
+def normalize_contract(contract: str) -> str:
+    return (contract or "").strip().upper()
 
 
 def stable_fingerprint(parts: List[str]) -> str:
-    norm: List[str] = []
+    norm = []
     for p in parts:
         s = (p or "").strip().upper()
         s = " ".join(s.split())
@@ -207,28 +178,77 @@ def stable_fingerprint(parts: List[str]) -> str:
     return sha16("|".join(norm))
 
 
-def dedupe_event_check(event_key: str) -> bool:
+def _prune_ordered_cache(cache: "OrderedDict[str, float]", ttl: int, max_keys: int) -> None:
+    now = time.time()
+    while cache:
+        k, ts = next(iter(cache.items()))
+        if (now - ts) <= ttl:
+            break
+        cache.popitem(last=False)
+    while len(cache) > max_keys:
+        cache.popitem(last=False)
+
+
+def _mark_seen(cache: "OrderedDict[str, float]", key: str) -> None:
+    now = time.time()
+    cache[key] = now
+    cache.move_to_end(key, last=True)
+
+
+def _seen_recently(cache: "OrderedDict[str, float]", key: str, ttl: int) -> bool:
+    now = time.time()
+    ts = cache.get(key)
+    if ts is None:
+        return False
+    return (now - ts) <= ttl
+
+
+def dedupe_event(key: str) -> bool:
+    """Return True if we should SEND; False if duplicate."""
     _prune_ordered_cache(state.sent_cache, DEDUP_TTL_SECONDS, DEDUP_MAX_KEYS)
-    return not _seen_recently(state.sent_cache, event_key, DEDUP_TTL_SECONDS)
+    if _seen_recently(state.sent_cache, key, DEDUP_TTL_SECONDS):
+        return False
+    _mark_seen(state.sent_cache, key)
+    return True
 
 
-def dedupe_event_mark(event_key: str) -> None:
-    _mark_seen(state.sent_cache, event_key)
-
-
-def contract_check(contract: str) -> bool:
-    c = (contract or "").strip().upper()
+def suppress_contract(contract: str) -> bool:
+    """Cross-stream suppression by contract (Flow vs Chain)."""
+    c = normalize_contract(contract)
     if not c:
         return True
     _prune_ordered_cache(state.sent_contract_cache, CROSS_STREAM_SUPPRESS_SECONDS, DEDUP_MAX_KEYS)
-    return not _seen_recently(state.sent_contract_cache, c, CROSS_STREAM_SUPPRESS_SECONDS)
-
-
-def contract_mark(contract: str) -> None:
-    c = (contract or "").strip().upper()
-    if not c:
-        return
+    if _seen_recently(state.sent_contract_cache, c, CROSS_STREAM_SUPPRESS_SECONDS):
+        return False
     _mark_seen(state.sent_contract_cache, c)
+    return True
+
+
+@dataclass
+class CacheItem:
+    value: Any
+    expires_at: datetime
+
+
+@dataclass
+class State:
+    running: bool = False
+    flow_newer_than: Optional[str] = None
+    alerts_newer_than: Optional[str] = None
+
+    cooldown: Dict[str, datetime] = field(default_factory=dict)
+
+    market_tide_cache: Optional[CacheItem] = None
+    darkpool_cache: Dict[str, CacheItem] = field(default_factory=dict)
+
+    chain_seen: Dict[str, datetime] = field(default_factory=dict)
+
+    # Cross-module dedupe caches
+    sent_cache: "OrderedDict[str, float]" = field(default_factory=OrderedDict)
+    sent_contract_cache: "OrderedDict[str, float]" = field(default_factory=OrderedDict)
+
+
+state = State()
 
 
 def cooldown_ok(key: str) -> bool:
@@ -245,28 +265,31 @@ def cooldown_ok(key: str) -> bool:
 
 
 # ----------------------------
-# UW HTTP client
+# UW HTTP
 # ----------------------------
 async def uw_get(client: httpx.AsyncClient, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     url = f"{UW_BASE_URL}{path}"
     r = await client.get(url, headers=uw_headers(), params=params or {}, timeout=30)
+
     if r.status_code in (401, 403):
+        log.error("UW auth failed %s %s token_present=%s token_len=%d",
+                  r.status_code, path, bool(UW_TOKEN), len(UW_TOKEN or ""))
         try:
             raise RuntimeError(f"UW auth error {r.status_code}: {r.json()}")
         except Exception:
             raise RuntimeError(f"UW auth error {r.status_code}: {r.text}")
+
     r.raise_for_status()
     return r.json()
 
 
 # ----------------------------
-# Market Tide cache
+# Market Tide (cached)
 # ----------------------------
 async def get_market_tide(client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     now = now_utc()
     if state.market_tide_cache and state.market_tide_cache.expires_at > now:
         return state.market_tide_cache.value
-
     try:
         data = await uw_get(client, "/api/market/market-tide", params={"interval_5m": "true"})
         state.market_tide_cache = CacheItem(value=data, expires_at=now + timedelta(seconds=MARKET_TIDE_CACHE_SECONDS))
@@ -299,14 +322,13 @@ def summarize_market_tide(tide_json: Any) -> str:
 
 
 # ----------------------------
-# Darkpool cache
+# Darkpool (cached per ticker)
 # ----------------------------
 async def get_darkpool_for_ticker(client: httpx.AsyncClient, ticker: str) -> Optional[Dict[str, Any]]:
     now = now_utc()
     ci = state.darkpool_cache.get(ticker)
     if ci and ci.expires_at > now:
         return ci.value
-
     try:
         data = await uw_get(client, f"/api/darkpool/{ticker}", params={"limit": 25})
         state.darkpool_cache[ticker] = CacheItem(value=data, expires_at=now + timedelta(seconds=DARKPOOL_CACHE_SECONDS))
@@ -333,7 +355,7 @@ def summarize_darkpool(dp_json: Any) -> str:
         if price is not None:
             parts.append(f"px `{price}`")
         if side:
-            parts.append(side)
+            parts.append(f"{side}")
         return " | ".join(parts) if parts else "n/a"
     except Exception:
         return "n/a"
