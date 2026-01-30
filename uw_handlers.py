@@ -97,25 +97,35 @@ def _as_int(x: Any, default: int = 0) -> int:
 # ----------------------------
 def market_bias_from_tide(tide: Any) -> str:
     """
-    Try to infer broad market bias (UP/DOWN/MIXED) from MarketTide payload.
-    We rely on common keys but keep it robust.
+    Uses Unusual Whales /api/market/market-tide response:
+      tide["data"] = list of intervals, each has:
+        net_call_premium (string number)
+        net_put_premium  (string number)
+    We take the latest interval and compare net_call_premium vs net_put_premium.
     """
     if not isinstance(tide, dict):
         return "MIXED"
 
-    calls = _as_float(tide.get("calls") or tide.get("call_notional") or tide.get("calls_notional") or tide.get("calls_total"), 0.0)
-    puts = _as_float(tide.get("puts") or tide.get("put_notional") or tide.get("puts_notional") or tide.get("puts_total"), 0.0)
+    rows = tide.get("data")
+    if not isinstance(rows, list) or not rows:
+        return "MIXED"
 
-    # Some feeds encode puts as negative; normalize to magnitude for compare but keep net sign logic.
-    # We'll compare "calls - puts" after forcing puts to positive magnitude if negative.
-    puts_mag = abs(puts)
-    net = calls - puts_mag
+    last = rows[-1] if isinstance(rows[-1], dict) else None
+    if not last:
+        return "MIXED"
+
+    call_net = _as_float(last.get("net_call_premium"), 0.0)
+    put_net  = _as_float(last.get("net_put_premium"), 0.0)
+
+    # Net difference (calls minus puts)
+    net = call_net - put_net
 
     if net >= MARKET_TIDE_NOTIONAL_THRESHOLD:
         return "UP"
     if net <= -MARKET_TIDE_NOTIONAL_THRESHOLD:
         return "DOWN"
     return "MIXED"
+
 
 
 def prefer_side_for_market(mkt_bias: str) -> str:
