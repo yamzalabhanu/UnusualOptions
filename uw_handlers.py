@@ -2,7 +2,8 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any, Dict, List, Tuple
+from datetime import datetime, date, timezone
+from typing import Any, Dict, List, Tuple, Optional
 
 import httpx
 
@@ -50,15 +51,23 @@ from chatgpt import send_via_gpt_formatter, telegram_send
 log = logging.getLogger("uw_app.handlers")
 
 # ----------------------------
-# Alert Quality Gates (NEW)
+# Alert Quality Gates
 # ----------------------------
-# Only send alerts if "signal strength" is >= 8/10.
-# Flow strength uses score/100, so require >= 80.
 MIN_SIGNAL_STRENGTH_0_10 = float(os.getenv("MIN_SIGNAL_STRENGTH_0_10", "8.0"))
 MIN_SCORE_0_100 = int(round(MIN_SIGNAL_STRENGTH_0_10 * 10))  # 8/10 => 80/100
-
-# Premium must be "very large" to alert
 VERY_LARGE_PREMIUM_USD = float(os.getenv("VERY_LARGE_PREMIUM_USD", "250000"))
+
+# Market bias threshold: if calls notional exceeds puts by this amount => "UP", vice versa => "DOWN"
+MARKET_TIDE_NOTIONAL_THRESHOLD = float(os.getenv("MARKET_TIDE_NOTIONAL_THRESHOLD", "10000000"))  # $10M
+
+# Recommendation tuning
+STRONG_BUY_MIN_SCORE = int(os.getenv("STRONG_BUY_MIN_SCORE", "90"))
+BUY_MIN_SCORE = int(os.getenv("BUY_MIN_SCORE", "85"))
+MODERATE_BUY_MIN_SCORE = int(os.getenv("MODERATE_BUY_MIN_SCORE", "80"))
+
+STRONG_BUY_MIN_PREM = float(os.getenv("STRONG_BUY_MIN_PREM", "1000000"))   # $1M
+BUY_MIN_PREM = float(os.getenv("BUY_MIN_PREM", "500000"))                  # $500k
+MODERATE_BUY_MIN_PREM = float(os.getenv("MODERATE_BUY_MIN_PREM", "250000"))# $250k (matches "very large" gate)
 
 
 def premium_label(p: float) -> str:
@@ -69,20 +78,219 @@ def premium_label(p: float) -> str:
     return "very large" if v >= VERY_LARGE_PREMIUM_USD else "large"
 
 
+def _as_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def _as_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+# ----------------------------
+# Market regime helpers
+# ----------------------------
+def market_bias_from_tide(tide: Any) -> str:
+    """
+    Try to infer broad market bias (UP/DOWN/MIXED) from MarketTide payload.
+    We rely on common keys but keep it robust.
+    """
+    if not isinstance(tide, dict):
+        return "MIXED"
+
+    calls = _as_float(tide.get("calls") or tide.get("call_notional") or tide.get("calls_notional") or tide.get("calls_total"), 0.0)
+    puts = _as_float(tide.get("puts") or tide.get("put_notional") or tide.get("puts_notional") or tide.get("puts_total"), 0.0)
+
+    # Some feeds encode puts as negative; normalize to magnitude for compare but keep net sign logic.
+    # We'll compare "calls - puts" after forcing puts to positive magnitude if negative.
+    puts_mag = abs(puts)
+    net = calls - puts_mag
+
+    if net >= MARKET_TIDE_NOTIONAL_THRESHOLD:
+        return "UP"
+    if net <= -MARKET_TIDE_NOTIONAL_THRESHOLD:
+        return "DOWN"
+    return "MIXED"
+
+
+def prefer_side_for_market(mkt_bias: str) -> str:
+    if mkt_bias == "UP":
+        return "CALL"
+    if mkt_bias == "DOWN":
+        return "PUT"
+    return "EITHER"
+
+
+# ----------------------------
+# Expiry / DTE helpers
+# ----------------------------
+def _parse_date_any(s: Any) -> Optional[date]:
+    if not s:
+        return None
+    if isinstance(s, date) and not isinstance(s, datetime):
+        return s
+    if isinstance(s, datetime):
+        return s.date()
+    if isinstance(s, str):
+        s = s.strip()
+        # Try ISO
+        for fmt in ("%Y-%m-%d", "%Y%m%d"):
+            try:
+                return datetime.strptime(s[:10], fmt).date()
+            except Exception:
+                pass
+    return None
+
+
+def parse_occ_expiry(contract: str) -> Optional[date]:
+    """
+    Parse OCC option symbol: underlying + yymmdd + C/P + strike...
+    Example: NVDA260130C00187500 (yymmdd = 260130)
+    """
+    if not contract or not isinstance(contract, str):
+        return None
+    c = contract.strip().upper()
+
+    # Find the yymmdd + [CP] pattern.
+    # Commonly appears as ...YYMMDDC... or ...YYMMDDP...
+    for i in range(0, len(c) - 7):
+        chunk = c[i : i + 7]  # yymmdd + letter
+        yymmdd = chunk[:6]
+        cp = chunk[6:7]
+        if cp not in ("C", "P"):
+            continue
+        if not yymmdd.isdigit():
+            continue
+        try:
+            yy = int(yymmdd[0:2])
+            mm = int(yymmdd[2:4])
+            dd = int(yymmdd[4:6])
+            # 20xx assumption
+            yyyy = 2000 + yy
+            return date(yyyy, mm, dd)
+        except Exception:
+            continue
+    return None
+
+
+def dte_and_horizon(expiry: Optional[date]) -> Tuple[Optional[int], str]:
+    if not expiry:
+        return None, "unknown"
+    today = now_utc().date()
+    dte = (expiry - today).days
+    if dte <= 0:
+        return dte, "day trade"
+    if dte <= 7:
+        return dte, "day trade"
+    if dte <= 30:
+        return dte, "swing trade"
+    return dte, "swing/position"
+
+
+# ----------------------------
+# Recommendation logic
+# ----------------------------
+def recommendation_from_metrics(
+    *,
+    score_0_100: Optional[int],
+    premium: float,
+    volume: int,
+    oi: int,
+    vol_oi: Optional[float],
+    opt_type: str,
+    market_bias: str,
+    ask_vol: Optional[int] = None,
+    bid_vol: Optional[int] = None,
+    sweeps: Optional[int] = None,
+    multileg: Optional[int] = None,
+) -> Tuple[str, str]:
+    """
+    Returns (recommendation, notes)
+    recommendation: Strong Buy / Buy / Moderate Buy / Watch
+    notes: short explanation + market alignment note
+    """
+    s = score_0_100 if isinstance(score_0_100, int) else None
+    prem = float(premium or 0.0)
+    vol = int(volume or 0)
+    oii = int(oi or 0)
+    vratio = vol_oi if (vol_oi is not None) else (vol / oii if oii > 0 else None)
+
+    # Tape aggression (if available)
+    aggression = None
+    if ask_vol is not None and bid_vol is not None and (ask_vol + bid_vol) > 0:
+        aggression = (ask_vol - bid_vol) / float(ask_vol + bid_vol)
+
+    # Baseline tier by score+premium first
+    rec = "Watch"
+    if s is not None:
+        if s >= STRONG_BUY_MIN_SCORE and prem >= STRONG_BUY_MIN_PREM:
+            rec = "Strong Buy"
+        elif s >= BUY_MIN_SCORE and prem >= BUY_MIN_PREM:
+            rec = "Buy"
+        elif s >= MODERATE_BUY_MIN_SCORE and prem >= MODERATE_BUY_MIN_PREM:
+            rec = "Moderate Buy"
+        else:
+            rec = "Watch"
+    else:
+        # Chain path (no score): use premium + vol/oi + volume as proxy
+        if prem >= STRONG_BUY_MIN_PREM and (vratio or 0) >= 1.5 and vol >= max(MIN_HARD_VOLUME, 1000):
+            rec = "Buy"
+        elif prem >= BUY_MIN_PREM and (vratio or 0) >= 1.2:
+            rec = "Moderate Buy"
+        elif prem >= MODERATE_BUY_MIN_PREM and (vratio or 0) >= 1.0:
+            rec = "Moderate Buy"
+        else:
+            rec = "Watch"
+
+    notes_bits: List[str] = []
+
+    # Explain drivers
+    if s is not None:
+        notes_bits.append(f"strength={round(s/10,1)}/10")
+    notes_bits.append(f"prem={money(prem)}")
+    notes_bits.append(f"vol={vol}, oi={oii}")
+    if vratio is not None:
+        notes_bits.append(f"vol/oi={vratio:.2f}")
+    if aggression is not None:
+        notes_bits.append(f"aggr={aggression:+.2f}")
+    if sweeps is not None:
+        notes_bits.append(f"sweeps={sweeps}")
+    if multileg is not None:
+        notes_bits.append(f"multileg={multileg}")
+
+    # Market alignment: prefer CALL when UP, PUT when DOWN
+    preferred = prefer_side_for_market(market_bias)
+    aligns = (preferred == "EITHER") or (preferred == opt_type)
+    if not aligns and preferred != "EITHER":
+        # Downgrade one notch if fighting tape
+        if rec == "Strong Buy":
+            rec = "Buy"
+        elif rec == "Buy":
+            rec = "Moderate Buy"
+        elif rec == "Moderate Buy":
+            rec = "Watch"
+        notes_bits.append(f"⚠️ market_bias={market_bias} prefers {preferred}")
+    else:
+        notes_bits.append(f"market_bias={market_bias}")
+
+    return rec, "; ".join(notes_bits)
+
+
 # ----------------------------
 # Flow helpers
 # ----------------------------
 def get_flow_fields(a: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "ticker": str(a.get("ticker_symbol") or a.get("ticker") or a.get("symbol") or "UNK").upper(),
-        "opt_type": "CALL"
-        if bool(a.get("is_call"))
-        else ("PUT" if bool(a.get("is_put")) else str(a.get("type") or "").upper()),
+        "opt_type": "CALL" if bool(a.get("is_call")) else ("PUT" if bool(a.get("is_put")) else str(a.get("type") or "").upper()),
         "premium": safe_float(a.get("total_premium") or a.get("premium") or a.get("notional") or a.get("total_notional")),
         "vol_oi": safe_float(a.get("min_volume_oi_ratio") or a.get("volume_oi_ratio") or a.get("vol_oi_ratio") or a.get("volume_oi")),
-        "side": "ask"
-        if bool(a.get("is_ask_side"))
-        else ("bid" if bool(a.get("is_bid_side")) else str(a.get("side") or a.get("trade_side") or "")),
+        "side": "ask" if bool(a.get("is_ask_side")) else ("bid" if bool(a.get("is_bid_side")) else str(a.get("side") or a.get("trade_side") or "")),
         "strike": safe_float(a.get("strike")),
         "expiry": a.get("expiry") or a.get("expiration") or a.get("exp_date"),
         "delta": safe_float(a.get("delta") or a.get("option_delta")),
@@ -173,8 +381,8 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
     if vol < MIN_HARD_VOLUME or oi < MIN_HARD_OI:
         return
 
-    # PREMIUM GATE (must be "very large")
     prem = f.get("premium") or 0.0
+    # Premium must be "very large"
     if prem < VERY_LARGE_PREMIUM_USD:
         return
 
@@ -182,7 +390,7 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
     if score < MIN_SCORE_TO_ALERT:
         return
 
-    # SIGNAL STRENGTH GATE: >= 8/10 => score >= 80/100
+    # Signal strength >= 8/10 (score >= 80/100)
     if score < MIN_SCORE_0_100:
         return
 
@@ -214,12 +422,38 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
     tide = await get_market_tide(client)
     dp = await get_darkpool_for_ticker(client, ticker)
 
+    mkt_bias = market_bias_from_tide(tide)
+    expiry_dt = _parse_date_any(f.get("expiry")) or parse_occ_expiry(contract)
+    dte, horizon = dte_and_horizon(expiry_dt)
+
+    rec, rec_notes = recommendation_from_metrics(
+        score_0_100=score,
+        premium=prem,
+        volume=vol,
+        oi=oi,
+        vol_oi=f.get("vol_oi"),
+        opt_type=str(f.get("opt_type") or "").upper(),
+        market_bias=mkt_bias,
+        # flow alerts generally don't have ask/bid split; keep None
+    )
+
+    header = f"🚨 *UW Flow Alert* — *{ticker}* | *Score:* `{score}/100` | *Rec:* *{rec}*"
+    trade_line = f"• Type/Side: `{f.get('opt_type')}` / `{str(f.get('side') or 'n/a')}` | Rule: `{f.get('rule')}`"
+    horizon_line = f"• Horizon: *{horizon}*" + (f" | DTE: `{dte}`" if dte is not None else "")
+    market_line = f"• Market bias: *{mkt_bias}* (prefers {prefer_side_for_market(mkt_bias)})"
+    premium_line = f"• Premium: *{money(prem)}* ({premium_label(prem)}) | Vol/OI: `{f.get('vol_oi')}` | Δ: `{f.get('delta')}`"
+    stats_line = f"• Vol: `{vol}` | OI: `{oi}` | Underlying: `{f.get('underlying')}`"
+    notes_line = f"• Notes: `{rec_notes}`"
+
     lines = [
-        f"🚨 *UW Flow Alert* — *{ticker}* | *Score:* `{score}/100`",
-        f"• Type/Side: `{f.get('opt_type')}` / `{str(f.get('side') or 'n/a')}` | Rule: `{f.get('rule')}`",
+        header,
+        trade_line,
         f"• Contract: `{contract or 'n/a'}`",
-        f"• Premium: *{money(prem)}* ({premium_label(prem)}) | Vol/OI: `{f.get('vol_oi')}` | Δ: `{f.get('delta')}`",
-        f"• Vol: `{vol}` | OI: `{oi}` | Underlying: `{f.get('underlying')}`",
+        premium_line,
+        stats_line,
+        horizon_line,
+        market_line,
+        notes_line,
         f"• MarketTide: {summarize_market_tide(tide)}",
         f"• Darkpool: {summarize_darkpool(dp)}",
         f"• Time: `{f.get('created_at')}`",
@@ -315,7 +549,7 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
             continue
         prem = f.get("total_premium") or 0.0
 
-        # PREMIUM GATE (must be "very large")
+        # Premium must be "very large"
         if prem < VERY_LARGE_PREMIUM_USD:
             continue
 
@@ -329,6 +563,7 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
 
     tide = await get_market_tide(client)
     dp = await get_darkpool_for_ticker(client, ticker)
+    mkt_bias = market_bias_from_tide(tide)
 
     for prem, f, reasons in top:
         contract = f.get("option_symbol") or ""
@@ -367,12 +602,40 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         voloi = (vol / oi) if (oi > 0) else None
         oi_chg = (oi - prev_oi) if (prev_oi is not None) else None
 
+        # Infer type from OCC symbol if possible
+        opt_type = "CALL" if "C" in contract[-9:-8] or "C" in contract else "PUT" if "P" in contract else "UNK"
+
+        expiry_dt = parse_occ_expiry(contract)
+        dte, horizon = dte_and_horizon(expiry_dt)
+
+        rec, rec_notes = recommendation_from_metrics(
+            score_0_100=None,  # chain has no score
+            premium=prem,
+            volume=vol,
+            oi=oi,
+            vol_oi=voloi,
+            opt_type=opt_type,
+            market_bias=mkt_bias,
+            ask_vol=f.get("ask_volume"),
+            bid_vol=f.get("bid_volume"),
+            sweeps=f.get("sweep_volume"),
+            multileg=f.get("multi_leg_volume"),
+        )
+
+        header = f"🔥 *UW Unusual Chain* — *{ticker}* | *Rec:* *{rec}*"
+        horizon_line = f"• Horizon: *{horizon}*" + (f" | DTE: `{dte}`" if dte is not None else "")
+        market_line = f"• Market bias: *{mkt_bias}* (prefers {prefer_side_for_market(mkt_bias)})"
+        notes_line = f"• Notes: `{rec_notes}`"
+
         lines = [
-            f"🔥 *UW Unusual Chain* — *{ticker}*",
+            header,
             f"• Contract: `{contract}`",
             f"• Premium: *{money(prem)}* ({premium_label(prem)}) | AvgPx: `{f.get('avg_price')}` | IV: `{f.get('iv')}`",
             f"• Vol: `{vol}` | OI: `{oi}` | PrevOI: `{prev_oi}` | OIΔ: `{oi_chg}` | Vol/OI: `{voloi}`",
             f"• AskVol: `{f.get('ask_volume')}` | BidVol: `{f.get('bid_volume')}` | Sweeps: `{f.get('sweep_volume')}` | MultiLeg: `{f.get('multi_leg_volume')}`",
+            horizon_line,
+            market_line,
+            notes_line,
             f"• Triggers: `{', '.join(reasons)}`",
             f"• MarketTide: {summarize_market_tide(tide)}",
             f"• Darkpool: {summarize_darkpool(dp)}",
