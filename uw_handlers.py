@@ -1,7 +1,7 @@
-
 import asyncio
 import json
 import logging
+import os
 from typing import Any, Dict, List, Tuple
 
 import httpx
@@ -49,6 +49,25 @@ from chatgpt import send_via_gpt_formatter, telegram_send
 
 log = logging.getLogger("uw_app.handlers")
 
+# ----------------------------
+# Alert Quality Gates (NEW)
+# ----------------------------
+# Only send alerts if "signal strength" is >= 8/10.
+# Flow strength uses score/100, so require >= 80.
+MIN_SIGNAL_STRENGTH_0_10 = float(os.getenv("MIN_SIGNAL_STRENGTH_0_10", "8.0"))
+MIN_SCORE_0_100 = int(round(MIN_SIGNAL_STRENGTH_0_10 * 10))  # 8/10 => 80/100
+
+# Premium must be "very large" to alert
+VERY_LARGE_PREMIUM_USD = float(os.getenv("VERY_LARGE_PREMIUM_USD", "250000"))
+
+
+def premium_label(p: float) -> str:
+    try:
+        v = float(p or 0.0)
+    except Exception:
+        v = 0.0
+    return "very large" if v >= VERY_LARGE_PREMIUM_USD else "large"
+
 
 # ----------------------------
 # Flow helpers
@@ -56,10 +75,14 @@ log = logging.getLogger("uw_app.handlers")
 def get_flow_fields(a: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "ticker": str(a.get("ticker_symbol") or a.get("ticker") or a.get("symbol") or "UNK").upper(),
-        "opt_type": "CALL" if bool(a.get("is_call")) else ("PUT" if bool(a.get("is_put")) else str(a.get("type") or "").upper()),
+        "opt_type": "CALL"
+        if bool(a.get("is_call"))
+        else ("PUT" if bool(a.get("is_put")) else str(a.get("type") or "").upper()),
         "premium": safe_float(a.get("total_premium") or a.get("premium") or a.get("notional") or a.get("total_notional")),
         "vol_oi": safe_float(a.get("min_volume_oi_ratio") or a.get("volume_oi_ratio") or a.get("vol_oi_ratio") or a.get("volume_oi")),
-        "side": "ask" if bool(a.get("is_ask_side")) else ("bid" if bool(a.get("is_bid_side")) else str(a.get("side") or a.get("trade_side") or "")),
+        "side": "ask"
+        if bool(a.get("is_ask_side"))
+        else ("bid" if bool(a.get("is_bid_side")) else str(a.get("side") or a.get("trade_side") or "")),
         "strike": safe_float(a.get("strike")),
         "expiry": a.get("expiry") or a.get("expiration") or a.get("exp_date"),
         "delta": safe_float(a.get("delta") or a.get("option_delta")),
@@ -150,8 +173,17 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
     if vol < MIN_HARD_VOLUME or oi < MIN_HARD_OI:
         return
 
+    # PREMIUM GATE (must be "very large")
+    prem = f.get("premium") or 0.0
+    if prem < VERY_LARGE_PREMIUM_USD:
+        return
+
     score = score_flow_alert(f)
     if score < MIN_SCORE_TO_ALERT:
+        return
+
+    # SIGNAL STRENGTH GATE: >= 8/10 => score >= 80/100
+    if score < MIN_SCORE_0_100:
         return
 
     contract = f.get("contract") or ""
@@ -164,7 +196,7 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
             f.get("ticker", ""),
             f.get("opt_type", ""),
             contract,
-            str(int((f.get("premium") or 0) / 1000)),  # bucket premium $1k
+            str(int((prem or 0) / 1000)),  # bucket premium $1k
             str(f.get("side") or ""),
             str(f.get("rule") or ""),
             str(f.get("strike") or ""),
@@ -186,7 +218,7 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
         f"🚨 *UW Flow Alert* — *{ticker}* | *Score:* `{score}/100`",
         f"• Type/Side: `{f.get('opt_type')}` / `{str(f.get('side') or 'n/a')}` | Rule: `{f.get('rule')}`",
         f"• Contract: `{contract or 'n/a'}`",
-        f"• Premium: *{money(f.get('premium'))}* | Vol/OI: `{f.get('vol_oi')}` | Δ: `{f.get('delta')}`",
+        f"• Premium: *{money(prem)}* ({premium_label(prem)}) | Vol/OI: `{f.get('vol_oi')}` | Δ: `{f.get('delta')}`",
         f"• Vol: `{vol}` | OI: `{oi}` | Underlying: `{f.get('underlying')}`",
         f"• MarketTide: {summarize_market_tide(tide)}",
         f"• Darkpool: {summarize_darkpool(dp)}",
@@ -282,6 +314,11 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         if not ok:
             continue
         prem = f.get("total_premium") or 0.0
+
+        # PREMIUM GATE (must be "very large")
+        if prem < VERY_LARGE_PREMIUM_USD:
+            continue
+
         scored.append((prem, f, reasons))
 
     if not scored:
@@ -333,7 +370,7 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         lines = [
             f"🔥 *UW Unusual Chain* — *{ticker}*",
             f"• Contract: `{contract}`",
-            f"• Premium: *{money(prem)}* | AvgPx: `{f.get('avg_price')}` | IV: `{f.get('iv')}`",
+            f"• Premium: *{money(prem)}* ({premium_label(prem)}) | AvgPx: `{f.get('avg_price')}` | IV: `{f.get('iv')}`",
             f"• Vol: `{vol}` | OI: `{oi}` | PrevOI: `{prev_oi}` | OIΔ: `{oi_chg}` | Vol/OI: `{voloi}`",
             f"• AskVol: `{f.get('ask_volume')}` | BidVol: `{f.get('bid_volume')}` | Sweeps: `{f.get('sweep_volume')}` | MultiLeg: `{f.get('multi_leg_volume')}`",
             f"• Triggers: `{', '.join(reasons)}`",
@@ -378,9 +415,7 @@ async def handle_custom_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> N
     if not cooldown_ok(key):
         return
 
-    fp = stable_fingerprint(
-        ["CUSTOM", str(a.get("noti_type") or ""), str(a.get("symbol") or ""), str(a.get("id") or "")]
-    )
+    fp = stable_fingerprint(["CUSTOM", str(a.get("noti_type") or ""), str(a.get("symbol") or ""), str(a.get("id") or "")])
     if not dedupe_event("evt:" + fp):
         return
 
