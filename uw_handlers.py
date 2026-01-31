@@ -28,6 +28,8 @@ from uw_core import (
     MIN_HARD_OI,
     MIN_SCORE_TO_ALERT,
     COOLDOWN_SECONDS,
+    FLOW_MAX_SEND_PER_CYCLE,
+    CHAINS_MAX_SEND_PER_CYCLE,
     state,
     now_utc,
     parse_iso,
@@ -39,35 +41,28 @@ from uw_core import (
     get_market_tide,
     get_darkpool_for_ticker,
     summarize_darkpool,
-    cooldown_ok,
-    dedupe_event,
-    suppress_contract,
     stable_fingerprint,
     market_hours_ok_now,
+
+    # ✅ async/persistent gates
+    cooldown_ok_async,
+    cooldown_ok_ticker_dir_async,
+    dedupe_event_async,
+    suppress_contract_async,
 )
 
 from chatgpt import send_via_gpt_formatter, telegram_send
 
 log = logging.getLogger("uw_app.handlers")
 
-
 # ============================================================
 # PATCH CONFIG
 # ============================================================
 
-# Enforce "alert only when strength >= 8/10"
 MIN_STRENGTH_10 = 8
-
-# Enforce "premium size must be very large" to send alerts
 VERY_LARGE_PREMIUM_USD = 2_000_000
-
-# MarketTide regime threshold (difference calls - puts)
 MARKET_TIDE_NOTIONAL_THRESHOLD = 25_000_000
-
-# Day vs swing based on DTE
 DAY_TRADE_MAX_DTE = 7
-
-# Ticker-direction cooldown to reduce spam (seconds)
 TICKER_DIR_COOLDOWN_SECONDS = 900
 
 
@@ -76,10 +71,6 @@ TICKER_DIR_COOLDOWN_SECONDS = 900
 # ============================================================
 
 def _as_float(x: Any, default: Any = 0.0) -> Any:
-    """
-    If default is None, returns None on parse failure.
-    Else returns float or default.
-    """
     try:
         if x is None:
             return default
@@ -98,17 +89,11 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 def strength_10_from_score(score_100: int) -> int:
-    # 0..100 -> 0..10 (ceil so 79->8/10, 80->8/10, 81->9/10 etc)
     score_100 = int(score_100 or 0)
     return max(0, min(10, int(math.ceil(score_100 / 10.0))))
 
 
 def parse_occ_expiry_from_contract(contract: str) -> Optional[date]:
-    """
-    OCC-ish option symbol format:
-      NVDA260130P00185000  -> YYMMDD in positions after root
-    Root is variable length; regex for 6-digit date before C/P.
-    """
     if not contract:
         return None
     m = re.search(r"(\d{6})([CP])", contract)
@@ -153,11 +138,6 @@ def premium_bucket_label(prem: float) -> str:
 
 
 def market_bias_from_tide(tide: Any) -> str:
-    """
-    Your payload:
-      {"data":[{"net_call_premium":"...","net_put_premium":"...","timestamp":"..."}], "date":"..."}
-    Use latest row and compare call vs put net.
-    """
     if not isinstance(tide, dict):
         return "MIXED"
     rows = tide.get("data")
@@ -190,24 +170,8 @@ def summarize_market_tide_compact(tide: Any) -> str:
     return f"bias={bias} | net={money(net)} call={money(call_net)} put={money(put_net)} | t={ts}"
 
 
-def cooldown_ok_ticker_dir(ticker: str, opt_type: str, seconds: int = TICKER_DIR_COOLDOWN_SECONDS) -> bool:
-    """
-    Extra anti-spam cooldown: only one alert per (ticker, direction) per window.
-    Uses state.cooldown so it shares the same pruning behavior.
-    """
-    key = f"tdir:{ticker}:{(opt_type or 'UNK').upper()}"
-    now = now_utc()
-    last = state.cooldown.get(key)
-    if last and (now - last).total_seconds() < seconds:
-        return False
-    state.cooldown[key] = now
-    return True
-
-
 def multileg_ratio(multileg_vol: Optional[int], vol: int) -> Optional[float]:
-    if multileg_vol is None:
-        return None
-    if not vol or vol <= 0:
+    if multileg_vol is None or not vol or vol <= 0:
         return None
     return float(multileg_vol) / float(vol)
 
@@ -220,14 +184,6 @@ def downgrade_steps_from_complexity(
     ask_vol: Optional[int] = None,
     bid_vol: Optional[int] = None,
 ) -> Tuple[int, str]:
-    """
-    Returns (downgrade_steps, explanation)
-      downgrade_steps: 0..3 (how many tiers to drop)
-    Heuristics:
-      - High multileg ratio => roll/complex => downgrade
-      - Big negative OIΔ => closing/roll => downgrade
-      - Mixed prints (ask ~ bid) => downgrade (if we have ask/bid)
-    """
     steps = 0
     notes: List[str] = []
 
@@ -287,16 +243,9 @@ def recommendation_tier(
     oi_chg: Optional[int],
     market_bias: str,
 ) -> Tuple[str, str]:
-    """
-    Returns (tier_label, reasoning_short)
-    tier_label: Strong Buy / Buy / Moderate Buy / Watch
-    """
     score = 0
+    score += max(0, strength10 - 5) * 3
 
-    # Strength is the primary gate; weighted heavily
-    score += max(0, strength10 - 5) * 3  # 8->9 points
-
-    # Premium weight
     if premium_usd >= 10_000_000:
         score += 8
     elif premium_usd >= 5_000_000:
@@ -306,7 +255,6 @@ def recommendation_tier(
     elif premium_usd >= 500_000:
         score += 2
 
-    # Vol/OI weight
     if voloi is not None:
         if voloi >= 3.0:
             score += 5
@@ -315,7 +263,6 @@ def recommendation_tier(
         elif voloi >= 1.2:
             score += 1
 
-    # OI change hint (if increasing, more likely opening)
     if oi_chg is not None:
         if oi_chg >= 500:
             score += 3
@@ -324,7 +271,6 @@ def recommendation_tier(
         elif oi_chg <= -500:
             score -= 2
 
-    # Regime preference
     if market_bias == "UP" and opt_type == "CALL":
         score += 2
     elif market_bias == "DOWN" and opt_type == "PUT":
@@ -334,13 +280,11 @@ def recommendation_tier(
     elif market_bias == "DOWN" and opt_type == "CALL":
         score -= 2
 
-    # Volume / OI raw size as a mild factor
     if vol >= 50_000:
         score += 2
     if oi >= 50_000:
         score += 2
 
-    # Map to tiers
     if score >= 20:
         tier = "Strong Buy"
     elif score >= 14:
@@ -449,44 +393,42 @@ def flow_alert_key(f: Dict[str, Any]) -> str:
     return sha16(raw)
 
 
-async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> None:
+async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> bool:
     if not market_hours_ok_now():
-        return
+        return False
 
     f = get_flow_fields(a)
 
     vol = f.get("volume") or 0
     oi = f.get("oi") or 0
     if vol < MIN_HARD_VOLUME or oi < MIN_HARD_OI:
-        return
+        return False
 
     score = score_flow_alert(f)
     strength10 = strength_10_from_score(score)
 
-    # PATCH 1: Strength gate (>=8/10)
     if strength10 < MIN_STRENGTH_10:
-        return
+        return False
 
     prem = float(f.get("premium") or 0.0)
-
-    # PATCH 2: Premium must be "very large"
     if prem < VERY_LARGE_PREMIUM_USD:
-        return
+        return False
 
-    # keep legacy score gate too
     if score < MIN_SCORE_TO_ALERT:
-        return
+        return False
 
     ticker = f["ticker"]
     opt_type = str(f.get("opt_type") or "").upper()
 
-    # NEW: extra anti-spam cooldown at ticker+direction level
-    if not cooldown_ok_ticker_dir(ticker, opt_type):
-        return
+    # ✅ persistent ticker-direction cooldown
+    if not await cooldown_ok_ticker_dir_async(ticker, opt_type, TICKER_DIR_COOLDOWN_SECONDS):
+        return False
 
     contract = f.get("contract") or ""
-    if not suppress_contract(contract):
-        return
+
+    # ✅ persistent cross-stream suppression
+    if not await suppress_contract_async(contract):
+        return False
 
     fp = stable_fingerprint(
         [
@@ -501,16 +443,18 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
             str(f.get("expiry") or ""),
         ]
     )
-    if not dedupe_event("evt:" + fp):
-        return
 
+    # ✅ persistent event dedupe
+    if not await dedupe_event_async("evt:" + fp):
+        return False
+
+    # ✅ persistent cooldown per unique flow
     key = "flow:" + flow_alert_key(f)
-    if not cooldown_ok(key):
-        return
+    if not await cooldown_ok_async(key, COOLDOWN_SECONDS):
+        return False
 
     tide = await get_market_tide(client)
     dp = await get_darkpool_for_ticker(client, ticker)
-
     bias = market_bias_from_tide(tide)
 
     tier, tier_reason = recommendation_tier(
@@ -524,11 +468,10 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
         market_bias=bias,
     )
 
-    # ----- MultiLeg / OIΔ downgrade (best-effort for flow feed) -----
+    # complexity downgrade (best effort)
     flow_multileg = safe_int(a.get("multi_leg_volume") or a.get("multi_leg") or a.get("multileg_volume"))
     flow_ask = safe_int(a.get("ask_volume") or a.get("askVol") or a.get("ask_volume_total"))
     flow_bid = safe_int(a.get("bid_volume") or a.get("bidVol") or a.get("bid_volume_total"))
-
     prev_oi = safe_int(a.get("prev_oi") or a.get("previous_open_interest") or a.get("prev_open_interest"))
     oi_chg = (int(oi) - int(prev_oi)) if (prev_oi is not None and oi is not None) else None
 
@@ -562,6 +505,8 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
 
     if f.get("created_at"):
         state.flow_newer_than = f["created_at"]
+
+    return True
 
 
 # ============================================================
@@ -618,18 +563,8 @@ def chain_is_unusual(f: Dict[str, Any]) -> Tuple[bool, List[str]]:
     return (len(real_triggers) > 0), reasons
 
 
-def chain_strength_10(
-    prem: float,
-    vol: int,
-    oi: int,
-    voloi: Optional[float],
-    oi_chg: Optional[int],
-) -> int:
-    """
-    Heuristic: map chain stats to strength 0..10
-    """
-    s = 4  # baseline
-
+def chain_strength_10(prem: float, vol: int, oi: int, voloi: Optional[float], oi_chg: Optional[int]) -> int:
+    s = 4
     if prem >= 10_000_000:
         s += 4
     elif prem >= 5_000_000:
@@ -659,7 +594,6 @@ def chain_strength_10(
         s += 1
     if oi >= 50_000:
         s += 1
-
     return max(0, min(10, s))
 
 
@@ -673,11 +607,7 @@ def opt_type_from_contract(contract: str) -> str:
 
 
 async def fetch_option_contracts(client: httpx.AsyncClient, ticker: str) -> List[Dict[str, Any]]:
-    params: Dict[str, Any] = {
-        "limit": 500,
-        "exclude_zero_vol_chains": "true",
-        "exclude_zero_oi_chains": "true",
-    }
+    params: Dict[str, Any] = {"limit": 500, "exclude_zero_vol_chains": "true", "exclude_zero_oi_chains": "true"}
     if CHAIN_VOL_GREATER_OI_ONLY:
         params["vol_greater_oi"] = "true"
 
@@ -686,14 +616,14 @@ async def fetch_option_contracts(client: httpx.AsyncClient, ticker: str) -> List
     return rows if isinstance(rows, list) else []
 
 
-async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str) -> None:
+async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str) -> int:
     if not market_hours_ok_now():
-        return
+        return 0
 
     try:
         rows = await fetch_option_contracts(client, ticker)
     except Exception:
-        return
+        return 0
 
     scored: List[Tuple[float, Dict[str, Any], List[str]]] = []
     for r in rows:
@@ -705,7 +635,7 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         scored.append((prem, f, reasons))
 
     if not scored:
-        return
+        return 0
 
     scored.sort(key=lambda x: x[0], reverse=True)
     top = scored[:3]
@@ -714,46 +644,32 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
     dp = await get_darkpool_for_ticker(client, ticker)
     bias = market_bias_from_tide(tide)
 
+    sent = 0
+
     for prem, f, reasons in top:
         contract = f.get("option_symbol") or ""
         if not contract:
             continue
-
-        # PATCH 2: Premium must be "very large"
         if prem < VERY_LARGE_PREMIUM_USD:
             continue
 
-        # Determine opt type early for cooldown
         opt_type = opt_type_from_contract(contract)
 
-        # NEW: extra anti-spam cooldown at ticker+direction level
-        if not cooldown_ok_ticker_dir(ticker, opt_type):
+        if not await cooldown_ok_ticker_dir_async(ticker, opt_type, TICKER_DIR_COOLDOWN_SECONDS):
             continue
 
-        if not suppress_contract(contract):
+        if not await suppress_contract_async(contract):
             continue
 
         fp = stable_fingerprint(
-            [
-                "CHAIN",
-                ticker,
-                contract,
-                str(int((prem or 0) / 1000)),
-                str(f.get("volume") or 0),
-                str(f.get("open_interest") or 0),
-            ]
+            ["CHAIN", ticker, contract, str(int((prem or 0) / 1000)), str(f.get("volume") or 0), str(f.get("open_interest") or 0)]
         )
-        if not dedupe_event("evt:" + fp):
+        if not await dedupe_event_async("evt:" + fp):
             continue
 
         unique = f"chain:{ticker}:{contract}"
-        last = state.chain_seen.get(unique)
-        if last and (now_utc() - last).total_seconds() < COOLDOWN_SECONDS:
-            continue
-        state.chain_seen[unique] = now_utc()
-
         key = "chain:" + sha16(unique + ":" + "|".join(sorted(reasons)))
-        if not cooldown_ok(key):
+        if not await cooldown_ok_async(key, COOLDOWN_SECONDS):
             continue
 
         vol = int(f.get("volume") or 0)
@@ -763,23 +679,11 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         oi_chg = (oi - prev_oi) if (prev_oi is not None) else None
 
         strength10 = chain_strength_10(prem, vol, oi, voloi, oi_chg)
-
-        # PATCH 1: Strength gate (>=8/10)
         if strength10 < MIN_STRENGTH_10:
             continue
 
-        tier, tier_reason = recommendation_tier(
-            opt_type=opt_type,
-            strength10=strength10,
-            premium_usd=prem,
-            vol=vol,
-            oi=oi,
-            voloi=voloi,
-            oi_chg=oi_chg,
-            market_bias=bias,
-        )
+        tier, tier_reason = recommendation_tier(opt_type, strength10, prem, vol, oi, voloi, oi_chg, bias)
 
-        # ----- MultiLeg / OIΔ downgrade (native for chain feed) -----
         downgrade_steps, flowtype_reason = downgrade_steps_from_complexity(
             vol=vol,
             oi=oi,
@@ -808,6 +712,9 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         ]
 
         await send_via_gpt_formatter("\n".join(lines), client)
+        sent += 1
+
+    return sent
 
 
 # ============================================================
@@ -840,14 +747,19 @@ async def handle_custom_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> N
     if not market_hours_ok_now():
         return
 
+    # (Custom alerts can remain simple; add redis gates later if you want)
     key = "alert:" + alert_key(a)
-    if not cooldown_ok(key):
-        return
 
-    fp = stable_fingerprint(
-        ["CUSTOM", str(a.get("noti_type") or ""), str(a.get("symbol") or ""), str(a.get("id") or "")]
-    )
-    if not dedupe_event("evt:" + fp):
+    # keep old in-memory cooldown if you want (or upgrade later)
+    # NOTE: we intentionally didn't force redis here because payloads vary a lot.
+    now = now_utc()
+    last = state.cooldown.get(key)
+    if last and (now - last).total_seconds() < COOLDOWN_SECONDS:
+        return
+    state.cooldown[key] = now
+
+    fp = stable_fingerprint(["CUSTOM", str(a.get("noti_type") or ""), str(a.get("symbol") or ""), str(a.get("id") or "")])
+    if not await dedupe_event_async("evt:" + fp):
         return
 
     name = a.get("name") or "Custom Alert"
@@ -875,6 +787,7 @@ async def handle_custom_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> N
 async def flow_loop() -> None:
     async with httpx.AsyncClient() as client:
         while state.running:
+            sent = 0
             try:
                 rows = await fetch_flow_alerts(client)
 
@@ -882,7 +795,10 @@ async def flow_loop() -> None:
                     return parse_iso(str(x.get("created_at") or "1970-01-01T00:00:00+00:00"))
 
                 for a in sorted(rows, key=_k):
-                    await handle_flow_alert(client, a)
+                    if sent >= FLOW_MAX_SEND_PER_CYCLE:
+                        break
+                    if await handle_flow_alert(client, a):
+                        sent += 1
             except Exception:
                 pass
 
@@ -893,9 +809,12 @@ async def chains_loop() -> None:
     async with httpx.AsyncClient() as client:
         while state.running:
             tickers = WATCHLIST or DEFAULT_WATCHLIST
+            total_sent = 0
             try:
                 for t in tickers:
-                    await scan_unusual_chains_for_ticker(client, t)
+                    if total_sent >= CHAINS_MAX_SEND_PER_CYCLE:
+                        break
+                    total_sent += await scan_unusual_chains_for_ticker(client, t)
             except Exception:
                 pass
 
