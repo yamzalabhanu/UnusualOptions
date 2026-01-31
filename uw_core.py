@@ -5,7 +5,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from collections import OrderedDict
 
 import httpx
@@ -60,11 +60,14 @@ DEDUP_TTL_SECONDS = int(os.getenv("DEDUP_TTL_SECONDS", "1800"))  # 30 min
 DEDUP_MAX_KEYS = int(os.getenv("DEDUP_MAX_KEYS", "20000"))
 CROSS_STREAM_SUPPRESS_SECONDS = int(os.getenv("CROSS_STREAM_SUPPRESS_SECONDS", "1800"))
 
+# Per-cycle caps (Top-N sending)
+FLOW_MAX_SEND_PER_CYCLE = int(os.getenv("FLOW_MAX_SEND_PER_CYCLE", "5"))
+CHAINS_MAX_SEND_PER_CYCLE = int(os.getenv("CHAINS_MAX_SEND_PER_CYCLE", "8"))
+
 # Redis (optional but recommended)
 REDIS_URL = (os.getenv("REDIS_URL", "") or "").strip()
 REDIS_PREFIX = (os.getenv("REDIS_PREFIX", "uw") or "uw").strip()
 REDIS_ENABLED = bool(REDIS_URL)
-
 
 ENABLE_CUSTOM_ALERTS_FEED = os.getenv("ENABLE_CUSTOM_ALERTS_FEED", "0") == "1"
 
@@ -77,6 +80,33 @@ DEFAULT_WATCHLIST = [
 ET = ZoneInfo("America/New_York")
 MARKET_OPEN_HHMM = (9, 30)
 MARKET_CLOSE_HHMM = (16, 0)
+
+# ----------------------------
+# State (MUST BE DEFINED EARLY)
+# ----------------------------
+@dataclass
+class CacheItem:
+    value: Any
+    expires_at: datetime
+
+@dataclass
+class State:
+    running: bool = False
+    flow_newer_than: Optional[str] = None
+    alerts_newer_than: Optional[str] = None
+
+    cooldown: Dict[str, datetime] = field(default_factory=dict)
+
+    market_tide_cache: Optional[CacheItem] = None
+    darkpool_cache: Dict[str, CacheItem] = field(default_factory=dict)
+
+    chain_seen: Dict[str, datetime] = field(default_factory=dict)
+
+    # Cross-module in-memory dedupe caches
+    sent_cache: "OrderedDict[str, float]" = field(default_factory=OrderedDict)
+    sent_contract_cache: "OrderedDict[str, float]" = field(default_factory=OrderedDict)
+
+state = State()
 
 # ----------------------------
 # Helpers
@@ -94,7 +124,6 @@ def require_env() -> None:
 
     log.info("UW auth configured: token_present=%s token_len=%d", bool(UW_TOKEN), len(UW_TOKEN or ""))
 
-
 def bearerize(token: str) -> str:
     t = (token or "").strip()
     if not t:
@@ -103,21 +132,14 @@ def bearerize(token: str) -> str:
         return t
     return f"Bearer {t}"
 
-
 def uw_headers() -> Dict[str, str]:
-    return {
-        "Accept": "application/json",
-        "Authorization": bearerize(UW_TOKEN),
-    }
-
+    return {"Accept": "application/json", "Authorization": bearerize(UW_TOKEN)}
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-
 def now_et() -> datetime:
     return datetime.now(tz=ET)
-
 
 def market_hours_ok_now() -> bool:
     """
@@ -125,14 +147,13 @@ def market_hours_ok_now() -> bool:
     NOTE: does NOT account for US market holidays/half-days.
     """
     t = now_et()
-    if t.weekday() >= 5:  # 5=Sat,6=Sun
+    if t.weekday() >= 5:
         return False
     open_h, open_m = MARKET_OPEN_HHMM
     close_h, close_m = MARKET_CLOSE_HHMM
     start = t.replace(hour=open_h, minute=open_m, second=0, microsecond=0)
     end = t.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
     return start <= t <= end
-
 
 def safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
     try:
@@ -142,7 +163,6 @@ def safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
     except Exception:
         return default
 
-
 def safe_int(x: Any, default: Optional[int] = None) -> Optional[int]:
     try:
         if x is None:
@@ -150,7 +170,6 @@ def safe_int(x: Any, default: Optional[int] = None) -> Optional[int]:
         return int(float(x))
     except Exception:
         return default
-
 
 def parse_iso(dt_str: str) -> datetime:
     if not dt_str:
@@ -160,20 +179,16 @@ def parse_iso(dt_str: str) -> datetime:
         s = s.replace("Z", "+00:00")
     return datetime.fromisoformat(s)
 
-
 def money(x: Optional[float]) -> str:
     if x is None:
         return "n/a"
     return f"${x:,.0f}"
 
-
 def sha16(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
-
 def normalize_contract(contract: str) -> str:
     return (contract or "").strip().upper()
-
 
 def stable_fingerprint(parts: List[str]) -> str:
     norm = []
@@ -183,23 +198,20 @@ def stable_fingerprint(parts: List[str]) -> str:
         norm.append(s)
     return sha16("|".join(norm))
 
-
 def _prune_ordered_cache(cache: "OrderedDict[str, float]", ttl: int, max_keys: int) -> None:
     now = time.time()
     while cache:
-        k, ts = next(iter(cache.items()))
+        _, ts = next(iter(cache.items()))
         if (now - ts) <= ttl:
             break
         cache.popitem(last=False)
     while len(cache) > max_keys:
         cache.popitem(last=False)
 
-
 def _mark_seen(cache: "OrderedDict[str, float]", key: str) -> None:
     now = time.time()
     cache[key] = now
     cache.move_to_end(key, last=True)
-
 
 def _seen_recently(cache: "OrderedDict[str, float]", key: str, ttl: int) -> bool:
     now = time.time()
@@ -208,25 +220,70 @@ def _seen_recently(cache: "OrderedDict[str, float]", key: str, ttl: int) -> bool
         return False
     return (now - ts) <= ttl
 
+# ----------------------------
+# Redis TTL Dedupe (optional)
+# ----------------------------
+_redis = None
 
+async def redis_client():
+    global _redis
+    if not REDIS_ENABLED:
+        return None
+    if _redis is None:
+        try:
+            import redis.asyncio as redis  # pip install "redis>=4.2"
+            _redis = redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
+        except Exception as e:
+            log.error("Redis init failed: %s", e)
+            _redis = None
+    return _redis
+
+def _rk(kind: str, key: str) -> str:
+    return f"{REDIS_PREFIX}:{kind}:{key}"
+
+async def redis_setnx_ttl(kind: str, key: str, ttl_seconds: int) -> bool:
+    """
+    Atomic: set key if not exists, with TTL.
+    Return True if newly set (allowed), False if already existed (duplicate).
+    """
+    r = await redis_client()
+    if not r:
+        return True
+    try:
+        redis_key = _rk(kind, key)
+        ok = await r.set(redis_key, "1", nx=True, ex=int(ttl_seconds))
+        return bool(ok)
+    except Exception as e:
+        log.error("Redis setnx failed kind=%s: %s", kind, e)
+        return True
+
+async def redis_touch_ttl(kind: str, key: str, ttl_seconds: int) -> None:
+    r = await redis_client()
+    if not r:
+        return
+    try:
+        redis_key = _rk(kind, key)
+        await r.set(redis_key, "1", ex=int(ttl_seconds))
+    except Exception as e:
+        log.error("Redis touch failed kind=%s: %s", kind, e)
+
+# ----------------------------
+# Async gates (Redis-first + in-mem)
+# ----------------------------
 async def dedupe_event_async(key: str) -> bool:
     """
     Return True if we should SEND; False if duplicate.
-    Redis-first for persistence, fallback to in-memory cache.
+    Redis-first for persistence, in-memory also prevents very fast repeats.
     """
-    # Redis persistent gate
     ok = await redis_setnx_ttl("dedupe", key, DEDUP_TTL_SECONDS)
     if not ok:
         return False
 
-    # In-memory gate (still useful to avoid redis round-trips if repeated fast)
     _prune_ordered_cache(state.sent_cache, DEDUP_TTL_SECONDS, DEDUP_MAX_KEYS)
     if _seen_recently(state.sent_cache, key, DEDUP_TTL_SECONDS):
         return False
     _mark_seen(state.sent_cache, key)
     return True
-
-
 
 async def suppress_contract_async(contract: str) -> bool:
     """
@@ -249,49 +306,27 @@ async def suppress_contract_async(contract: str) -> bool:
 
 async def cooldown_ok_async(key: str, seconds: int) -> bool:
     """
-    Persistent cooldown with Redis + fallback to in-memory.
+    Persistent cooldown with Redis + in-memory.
+    IMPORTANT: check in-memory first so we don't "burn" Redis keys unnecessarily.
     """
-    ok = await redis_setnx_ttl("cooldown", key, seconds)
-    if not ok:
-        return False
-
-    # Keep your existing in-memory cooldown too
     now = now_utc()
     last = state.cooldown.get(key)
     if last and (now - last).total_seconds() < seconds:
         return False
+
+    ok = await redis_setnx_ttl("cooldown", key, seconds)
+    if not ok:
+        return False
+
     state.cooldown[key] = now
     return True
 
+async def cooldown_ok_ticker_dir_async(ticker: str, opt_type: str, seconds: int = 900) -> bool:
+    return await cooldown_ok_async(f"tdir:{ticker}:{(opt_type or 'UNK').upper()}", seconds)
 
-
-@dataclass
-class CacheItem:
-    value: Any
-    expires_at: datetime
-
-
-@dataclass
-class State:
-    running: bool = False
-    flow_newer_than: Optional[str] = None
-    alerts_newer_than: Optional[str] = None
-
-    cooldown: Dict[str, datetime] = field(default_factory=dict)
-
-    market_tide_cache: Optional[CacheItem] = None
-    darkpool_cache: Dict[str, CacheItem] = field(default_factory=dict)
-
-    chain_seen: Dict[str, datetime] = field(default_factory=dict)
-
-    # Cross-module dedupe caches
-    sent_cache: "OrderedDict[str, float]" = field(default_factory=OrderedDict)
-    sent_contract_cache: "OrderedDict[str, float]" = field(default_factory=OrderedDict)
-
-
-state = State()
-
-
+# ----------------------------
+# Legacy sync cooldown (kept)
+# ----------------------------
 def cooldown_ok(key: str) -> bool:
     now = now_utc()
     last = state.cooldown.get(key)
@@ -303,7 +338,6 @@ def cooldown_ok(key: str) -> bool:
         cutoff = now - timedelta(seconds=COOLDOWN_SECONDS * 3)
         state.cooldown = {k: v for k, v in state.cooldown.items() if v >= cutoff}
     return True
-
 
 # ----------------------------
 # UW HTTP
@@ -323,7 +357,6 @@ async def uw_get(client: httpx.AsyncClient, path: str, params: Optional[Dict[str
     r.raise_for_status()
     return r.json()
 
-
 # ----------------------------
 # Market Tide (cached)
 # ----------------------------
@@ -337,7 +370,6 @@ async def get_market_tide(client: httpx.AsyncClient) -> Optional[Dict[str, Any]]
         return data
     except Exception:
         return None
-
 
 def summarize_market_tide(tide_json: Any) -> str:
     try:
@@ -360,16 +392,6 @@ def summarize_market_tide(tide_json: Any) -> str:
     except Exception:
         pass
     return "n/a"
-    
-def cooldown_ok_ticker_dir(ticker: str, opt_type: str, seconds: int = 900) -> bool:
-    key = f"tdir:{ticker}:{opt_type}"
-    now = now_utc()
-    last = state.cooldown.get(key)
-    if last and (now - last).total_seconds() < seconds:
-        return False
-    state.cooldown[key] = now
-    return True
-
 
 # ----------------------------
 # Darkpool (cached per ticker)
@@ -385,7 +407,6 @@ async def get_darkpool_for_ticker(client: httpx.AsyncClient, ticker: str) -> Opt
         return data
     except Exception:
         return None
-
 
 def summarize_darkpool(dp_json: Any) -> str:
     try:
@@ -410,54 +431,29 @@ def summarize_darkpool(dp_json: Any) -> str:
     except Exception:
         return "n/a"
 
-# ----------------------------
-# Redis TTL Dedupe (optional)
-# ----------------------------
-_redis = None
 
-async def redis_client():
-    global _redis
-    if not REDIS_ENABLED:
-        return None
-    if _redis is None:
-        try:
-            import redis.asyncio as redis  # pip install "redis>=4.2"
-            _redis = redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
-        except Exception as e:
-            log.error("Redis init failed: %s", e)
-            _redis = None
-    return _redis
+__all__ = [
+    # config
+    "WATCHLIST", "DEFAULT_WATCHLIST",
+    "FLOW_POLL_SECONDS", "CHAIN_POLL_SECONDS", "ALERTS_POLL_SECONDS",
+    "MIN_FLOW_PREMIUM", "MIN_FLOW_VOL_OI_RATIO", "FLOW_ASK_ONLY", "FLOW_LIMIT",
+    "CHAIN_VOL_OI_RATIO", "CHAIN_MIN_VOLUME", "CHAIN_MIN_OI",
+    "CHAIN_MIN_PREMIUM", "CHAIN_MIN_OI_CHANGE", "CHAIN_VOL_GREATER_OI_ONLY",
+    "MIN_HARD_VOLUME", "MIN_HARD_OI",
+    "MIN_SCORE_TO_ALERT", "COOLDOWN_SECONDS",
+    "FLOW_MAX_SEND_PER_CYCLE", "CHAINS_MAX_SEND_PER_CYCLE",
 
+    # state + helpers
+    "state", "now_utc", "parse_iso", "safe_float", "safe_int", "money", "sha16",
+    "stable_fingerprint", "market_hours_ok_now",
 
-def _rk(kind: str, key: str) -> str:
-    return f"{REDIS_PREFIX}:{kind}:{key}"
+    # uw api
+    "uw_get", "get_market_tide", "get_darkpool_for_ticker", "summarize_darkpool",
 
-
-async def redis_setnx_ttl(kind: str, key: str, ttl_seconds: int) -> bool:
-    """
-    Atomic: set key if not exists, with TTL.
-    Return True if newly set (allowed), False if already existed (duplicate).
-    """
-    r = await redis_client()
-    if not r:
-        return True  # no redis -> allow; caller should fallback to in-memory gates too
-    try:
-        redis_key = _rk(kind, key)
-        ok = await r.set(redis_key, "1", nx=True, ex=int(ttl_seconds))
-        return bool(ok)
-    except Exception as e:
-        log.error("Redis setnx failed kind=%s: %s", kind, e)
-        return True
-
-
-async def redis_touch_ttl(kind: str, key: str, ttl_seconds: int) -> None:
-    """Set/refresh TTL unconditionally (useful for cooldowns)."""
-    r = await redis_client()
-    if not r:
-        return
-    try:
-        redis_key = _rk(kind, key)
-        await r.set(redis_key, "1", ex=int(ttl_seconds))
-    except Exception as e:
-        log.error("Redis touch failed kind=%s: %s", kind, e)
-
+    # gates
+    "cooldown_ok",                # legacy sync
+    "cooldown_ok_async",
+    "cooldown_ok_ticker_dir_async",
+    "dedupe_event_async",
+    "suppress_contract_async",
+]
