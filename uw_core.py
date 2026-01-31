@@ -60,6 +60,12 @@ DEDUP_TTL_SECONDS = int(os.getenv("DEDUP_TTL_SECONDS", "1800"))  # 30 min
 DEDUP_MAX_KEYS = int(os.getenv("DEDUP_MAX_KEYS", "20000"))
 CROSS_STREAM_SUPPRESS_SECONDS = int(os.getenv("CROSS_STREAM_SUPPRESS_SECONDS", "1800"))
 
+# Redis (optional but recommended)
+REDIS_URL = (os.getenv("REDIS_URL", "") or "").strip()
+REDIS_PREFIX = (os.getenv("REDIS_PREFIX", "uw") or "uw").strip()
+REDIS_ENABLED = bool(REDIS_URL)
+
+
 ENABLE_CUSTOM_ALERTS_FEED = os.getenv("ENABLE_CUSTOM_ALERTS_FEED", "0") == "1"
 
 DEFAULT_WATCHLIST = [
@@ -203,8 +209,17 @@ def _seen_recently(cache: "OrderedDict[str, float]", key: str, ttl: int) -> bool
     return (now - ts) <= ttl
 
 
-def dedupe_event(key: str) -> bool:
-    """Return True if we should SEND; False if duplicate."""
+async def dedupe_event_async(key: str) -> bool:
+    """
+    Return True if we should SEND; False if duplicate.
+    Redis-first for persistence, fallback to in-memory cache.
+    """
+    # Redis persistent gate
+    ok = await redis_setnx_ttl("dedupe", key, DEDUP_TTL_SECONDS)
+    if not ok:
+        return False
+
+    # In-memory gate (still useful to avoid redis round-trips if repeated fast)
     _prune_ordered_cache(state.sent_cache, DEDUP_TTL_SECONDS, DEDUP_MAX_KEYS)
     if _seen_recently(state.sent_cache, key, DEDUP_TTL_SECONDS):
         return False
@@ -212,16 +227,42 @@ def dedupe_event(key: str) -> bool:
     return True
 
 
-def suppress_contract(contract: str) -> bool:
-    """Cross-stream suppression by contract (Flow vs Chain)."""
+
+async def suppress_contract_async(contract: str) -> bool:
+    """
+    Cross-stream suppression by contract (Flow vs Chain), persistent with Redis.
+    Return True if allowed, False if suppressed.
+    """
     c = normalize_contract(contract)
     if not c:
         return True
+
+    ok = await redis_setnx_ttl("contract", c, CROSS_STREAM_SUPPRESS_SECONDS)
+    if not ok:
+        return False
+
     _prune_ordered_cache(state.sent_contract_cache, CROSS_STREAM_SUPPRESS_SECONDS, DEDUP_MAX_KEYS)
     if _seen_recently(state.sent_contract_cache, c, CROSS_STREAM_SUPPRESS_SECONDS):
         return False
     _mark_seen(state.sent_contract_cache, c)
     return True
+
+async def cooldown_ok_async(key: str, seconds: int) -> bool:
+    """
+    Persistent cooldown with Redis + fallback to in-memory.
+    """
+    ok = await redis_setnx_ttl("cooldown", key, seconds)
+    if not ok:
+        return False
+
+    # Keep your existing in-memory cooldown too
+    now = now_utc()
+    last = state.cooldown.get(key)
+    if last and (now - last).total_seconds() < seconds:
+        return False
+    state.cooldown[key] = now
+    return True
+
 
 
 @dataclass
@@ -368,3 +409,55 @@ def summarize_darkpool(dp_json: Any) -> str:
         return " | ".join(parts) if parts else "n/a"
     except Exception:
         return "n/a"
+
+# ----------------------------
+# Redis TTL Dedupe (optional)
+# ----------------------------
+_redis = None
+
+async def redis_client():
+    global _redis
+    if not REDIS_ENABLED:
+        return None
+    if _redis is None:
+        try:
+            import redis.asyncio as redis  # pip install "redis>=4.2"
+            _redis = redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
+        except Exception as e:
+            log.error("Redis init failed: %s", e)
+            _redis = None
+    return _redis
+
+
+def _rk(kind: str, key: str) -> str:
+    return f"{REDIS_PREFIX}:{kind}:{key}"
+
+
+async def redis_setnx_ttl(kind: str, key: str, ttl_seconds: int) -> bool:
+    """
+    Atomic: set key if not exists, with TTL.
+    Return True if newly set (allowed), False if already existed (duplicate).
+    """
+    r = await redis_client()
+    if not r:
+        return True  # no redis -> allow; caller should fallback to in-memory gates too
+    try:
+        redis_key = _rk(kind, key)
+        ok = await r.set(redis_key, "1", nx=True, ex=int(ttl_seconds))
+        return bool(ok)
+    except Exception as e:
+        log.error("Redis setnx failed kind=%s: %s", kind, e)
+        return True
+
+
+async def redis_touch_ttl(kind: str, key: str, ttl_seconds: int) -> None:
+    """Set/refresh TTL unconditionally (useful for cooldowns)."""
+    r = await redis_client()
+    if not r:
+        return
+    try:
+        redis_key = _rk(kind, key)
+        await r.set(redis_key, "1", ex=int(ttl_seconds))
+    except Exception as e:
+        log.error("Redis touch failed kind=%s: %s", kind, e)
+
