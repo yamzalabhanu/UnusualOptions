@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 from collections import OrderedDict
+import redis.asyncio as redis
+
 
 import httpx
 from zoneinfo import ZoneInfo
