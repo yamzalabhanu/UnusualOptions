@@ -93,6 +93,10 @@ def _as_float(x: Any, default: Any = 0.0) -> Any:
         return default
 
 
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
 def strength_10_from_score(score_100: int) -> int:
     # 0..100 -> 0..10 (ceil so 79->8/10, 80->8/10, 81->9/10 etc)
     score_100 = int(score_100 or 0)
@@ -198,6 +202,79 @@ def cooldown_ok_ticker_dir(ticker: str, opt_type: str, seconds: int = TICKER_DIR
         return False
     state.cooldown[key] = now
     return True
+
+
+def multileg_ratio(multileg_vol: Optional[int], vol: int) -> Optional[float]:
+    if multileg_vol is None:
+        return None
+    if not vol or vol <= 0:
+        return None
+    return float(multileg_vol) / float(vol)
+
+
+def downgrade_steps_from_complexity(
+    vol: int,
+    oi: int,
+    oi_chg: Optional[int],
+    multileg_vol: Optional[int],
+    ask_vol: Optional[int] = None,
+    bid_vol: Optional[int] = None,
+) -> Tuple[int, str]:
+    """
+    Returns (downgrade_steps, explanation)
+      downgrade_steps: 0..3 (how many tiers to drop)
+    Heuristics:
+      - High multileg ratio => roll/complex => downgrade
+      - Big negative OIΔ => closing/roll => downgrade
+      - Mixed prints (ask ~ bid) => downgrade (if we have ask/bid)
+    """
+    steps = 0
+    notes: List[str] = []
+
+    mr = multileg_ratio(multileg_vol, vol)
+    if mr is not None:
+        if mr >= 0.60:
+            steps += 2
+            notes.append(f"multileg_ratio={mr:.2f} (very high)")
+        elif mr >= 0.35:
+            steps += 1
+            notes.append(f"multileg_ratio={mr:.2f} (high)")
+
+    if oi_chg is not None:
+        if oi_chg <= -5000:
+            steps += 2
+            notes.append(f"oiΔ={oi_chg} (sharp drop)")
+        elif oi_chg <= -1500:
+            steps += 1
+            notes.append(f"oiΔ={oi_chg} (drop)")
+
+    if ask_vol is not None and bid_vol is not None and (ask_vol + bid_vol) > 0:
+        total = ask_vol + bid_vol
+        ask_ratio = ask_vol / total
+        if 0.42 <= ask_ratio <= 0.58:
+            steps += 1
+            notes.append(f"prints_mixed ask%={ask_ratio:.2f}")
+
+    steps = int(_clamp(float(steps), 0.0, 3.0))
+
+    if steps == 0:
+        flowtype = "directional"
+    elif steps == 1:
+        flowtype = "mixed"
+    else:
+        flowtype = "roll/complex"
+
+    expl = ", ".join(notes) if notes else "no complexity flags"
+    return steps, f"{flowtype} | {expl}"
+
+
+def apply_tier_downgrade(tier: str, steps: int) -> str:
+    order = ["Strong Buy", "Buy", "Moderate Buy", "Watch"]
+    if tier not in order:
+        return tier
+    idx = order.index(tier)
+    idx2 = min(len(order) - 1, idx + max(0, int(steps)))
+    return order[idx2]
 
 
 def recommendation_tier(
@@ -447,11 +524,30 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
         market_bias=bias,
     )
 
+    # ----- MultiLeg / OIΔ downgrade (best-effort for flow feed) -----
+    flow_multileg = safe_int(a.get("multi_leg_volume") or a.get("multi_leg") or a.get("multileg_volume"))
+    flow_ask = safe_int(a.get("ask_volume") or a.get("askVol") or a.get("ask_volume_total"))
+    flow_bid = safe_int(a.get("bid_volume") or a.get("bidVol") or a.get("bid_volume_total"))
+
+    prev_oi = safe_int(a.get("prev_oi") or a.get("previous_open_interest") or a.get("prev_open_interest"))
+    oi_chg = (int(oi) - int(prev_oi)) if (prev_oi is not None and oi is not None) else None
+
+    downgrade_steps, flowtype_reason = downgrade_steps_from_complexity(
+        vol=int(vol),
+        oi=int(oi),
+        oi_chg=oi_chg,
+        multileg_vol=flow_multileg,
+        ask_vol=flow_ask,
+        bid_vol=flow_bid,
+    )
+    tier2 = apply_tier_downgrade(tier, downgrade_steps)
+
     horizon = trade_horizon_label(contract)
 
     lines = [
         f"🚨 *UW Flow Alert* — *{ticker}* | *Strength:* `{strength10}/10` | *Score:* `{score}/100`",
-        f"• Recommendation: *{tier}* | BiasPref: `{('CALL' if bias=='UP' else 'PUT') if bias in ('UP','DOWN') else 'MIXED'}` | Horizon: *{horizon}*",
+        f"• Recommendation: *{tier2}* (base={tier}, -{downgrade_steps}) | BiasPref: `{('CALL' if bias=='UP' else 'PUT') if bias in ('UP','DOWN') else 'MIXED'}` | Horizon: *{horizon}*",
+        f"• FlowType: `{flowtype_reason}`",
         f"• Type/Side: `{opt_type}` / `{str(f.get('side') or 'n/a')}` | Rule: `{f.get('rule')}`",
         f"• Contract: `{contract or 'n/a'}`",
         f"• Premium: *{money(prem)}* ({premium_bucket_label(prem)}) | Vol/OI: `{f.get('vol_oi')}` | Δ: `{f.get('delta')}`",
@@ -683,11 +779,23 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
             market_bias=bias,
         )
 
+        # ----- MultiLeg / OIΔ downgrade (native for chain feed) -----
+        downgrade_steps, flowtype_reason = downgrade_steps_from_complexity(
+            vol=vol,
+            oi=oi,
+            oi_chg=oi_chg,
+            multileg_vol=safe_int(f.get("multi_leg_volume")),
+            ask_vol=safe_int(f.get("ask_volume")),
+            bid_vol=safe_int(f.get("bid_volume")),
+        )
+        tier2 = apply_tier_downgrade(tier, downgrade_steps)
+
         horizon = trade_horizon_label(contract)
 
         lines = [
             f"🔥 *UW Unusual Chain* — *{ticker}* | *Strength:* `{strength10}/10`",
-            f"• Recommendation: *{tier}* | BiasPref: `{('CALL' if bias=='UP' else 'PUT') if bias in ('UP','DOWN') else 'MIXED'}` | Horizon: *{horizon}*",
+            f"• Recommendation: *{tier2}* (base={tier}, -{downgrade_steps}) | BiasPref: `{('CALL' if bias=='UP' else 'PUT') if bias in ('UP','DOWN') else 'MIXED'}` | Horizon: *{horizon}*",
+            f"• FlowType: `{flowtype_reason}`",
             f"• Contract: `{contract}` | Type: `{opt_type}`",
             f"• Premium: *{money(prem)}* ({premium_bucket_label(prem)}) | AvgPx: `{f.get('avg_price')}` | IV: `{f.get('iv')}`",
             f"• Vol: `{vol}` | OI: `{oi}` | PrevOI: `{prev_oi}` | OIΔ: `{oi_chg}` | Vol/OI: `{voloi}`",
