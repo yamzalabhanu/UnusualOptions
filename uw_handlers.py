@@ -3,7 +3,7 @@ import json
 import logging
 import math
 import re
-from datetime import datetime, timezone, date
+from datetime import date
 from typing import Any, Dict, List, Tuple, Optional
 
 import httpx
@@ -59,22 +59,27 @@ log = logging.getLogger("uw_app.handlers")
 MIN_STRENGTH_10 = 8
 
 # Enforce "premium size must be very large" to send alerts
-# (Tune this. Your example 9.1M should clearly pass.)
 VERY_LARGE_PREMIUM_USD = 2_000_000
 
 # MarketTide regime threshold (difference calls - puts)
-# Tune this. For your data, 25M–50M works well.
 MARKET_TIDE_NOTIONAL_THRESHOLD = 25_000_000
 
 # Day vs swing based on DTE
 DAY_TRADE_MAX_DTE = 7
+
+# Ticker-direction cooldown to reduce spam (seconds)
+TICKER_DIR_COOLDOWN_SECONDS = 900
 
 
 # ============================================================
 # Helpers
 # ============================================================
 
-def _as_float(x: Any, default: float = 0.0) -> float:
+def _as_float(x: Any, default: Any = 0.0) -> Any:
+    """
+    If default is None, returns None on parse failure.
+    Else returns float or default.
+    """
     try:
         if x is None:
             return default
@@ -96,9 +101,9 @@ def strength_10_from_score(score_100: int) -> int:
 
 def parse_occ_expiry_from_contract(contract: str) -> Optional[date]:
     """
-    OCC-ish option symbol format you’re getting:
+    OCC-ish option symbol format:
       NVDA260130P00185000  -> YYMMDD in positions after root
-    Root is variable length; easiest is regex for 6-digit date.
+    Root is variable length; regex for 6-digit date before C/P.
     """
     if not contract:
         return None
@@ -175,9 +180,24 @@ def summarize_market_tide_compact(tide: Any) -> str:
     last = tide["data"][-1]
     call_net = _as_float(last.get("net_call_premium"), 0.0)
     put_net = _as_float(last.get("net_put_premium"), 0.0)
+    net = call_net - put_net
     ts = last.get("timestamp") or "n/a"
     bias = market_bias_from_tide(tide)
-    return f"bias={bias} | net_call={money(call_net)} net_put={money(put_net)} | t={ts}"
+    return f"bias={bias} | net={money(net)} call={money(call_net)} put={money(put_net)} | t={ts}"
+
+
+def cooldown_ok_ticker_dir(ticker: str, opt_type: str, seconds: int = TICKER_DIR_COOLDOWN_SECONDS) -> bool:
+    """
+    Extra anti-spam cooldown: only one alert per (ticker, direction) per window.
+    Uses state.cooldown so it shares the same pruning behavior.
+    """
+    key = f"tdir:{ticker}:{(opt_type or 'UNK').upper()}"
+    now = now_utc()
+    last = state.cooldown.get(key)
+    if last and (now - last).total_seconds() < seconds:
+        return False
+    state.cooldown[key] = now
+    return True
 
 
 def recommendation_tier(
@@ -370,13 +390,21 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
     if strength10 < MIN_STRENGTH_10:
         return
 
-    # PATCH 2: Premium must be "very large"
     prem = float(f.get("premium") or 0.0)
+
+    # PATCH 2: Premium must be "very large"
     if prem < VERY_LARGE_PREMIUM_USD:
         return
 
-    # keep legacy score gate too (if you want)
+    # keep legacy score gate too
     if score < MIN_SCORE_TO_ALERT:
+        return
+
+    ticker = f["ticker"]
+    opt_type = str(f.get("opt_type") or "").upper()
+
+    # NEW: extra anti-spam cooldown at ticker+direction level
+    if not cooldown_ok_ticker_dir(ticker, opt_type):
         return
 
     contract = f.get("contract") or ""
@@ -386,8 +414,8 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
     fp = stable_fingerprint(
         [
             "FLOW",
-            f.get("ticker", ""),
-            f.get("opt_type", ""),
+            ticker,
+            opt_type,
             contract,
             str(int((prem or 0) / 1000)),  # bucket premium $1k
             str(f.get("side") or ""),
@@ -403,12 +431,10 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> Non
     if not cooldown_ok(key):
         return
 
-    ticker = f["ticker"]
     tide = await get_market_tide(client)
     dp = await get_darkpool_for_ticker(client, ticker)
 
     bias = market_bias_from_tide(tide)
-    opt_type = str(f.get("opt_type") or "").upper()
 
     tier, tier_reason = recommendation_tier(
         opt_type=opt_type,
@@ -601,6 +627,13 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         if prem < VERY_LARGE_PREMIUM_USD:
             continue
 
+        # Determine opt type early for cooldown
+        opt_type = opt_type_from_contract(contract)
+
+        # NEW: extra anti-spam cooldown at ticker+direction level
+        if not cooldown_ok_ticker_dir(ticker, opt_type):
+            continue
+
         if not suppress_contract(contract):
             continue
 
@@ -638,8 +671,6 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         # PATCH 1: Strength gate (>=8/10)
         if strength10 < MIN_STRENGTH_10:
             continue
-
-        opt_type = opt_type_from_contract(contract)
 
         tier, tier_reason = recommendation_tier(
             opt_type=opt_type,
