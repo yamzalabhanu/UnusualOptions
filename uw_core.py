@@ -304,8 +304,8 @@ def summarize_market_tide(tide_json: Any) -> str:
             last = tide_json["data"][-1]
             call = safe_float(last.get("net_call_premium"))
             put = safe_float(last.get("net_put_premium"))
-            net = safe_float(last.get("net_premium"))
-            ts = last.get("time") or last.get("timestamp") or last.get("tape_time") or ""
+            net = (call - put) if (call is not None and put is not None) else None
+            ts = last.get("timestamp") or last.get("time") or last.get("tape_time") or ""
             parts = []
             if net is not None:
                 parts.append(f"net `{money(net)}`")
@@ -319,6 +319,15 @@ def summarize_market_tide(tide_json: Any) -> str:
     except Exception:
         pass
     return "n/a"
+    
+def cooldown_ok_ticker_dir(ticker: str, opt_type: str, seconds: int = 900) -> bool:
+    key = f"tdir:{ticker}:{opt_type}"
+    now = now_utc()
+    last = state.cooldown.get(key)
+    if last and (now - last).total_seconds() < seconds:
+        return False
+    state.cooldown[key] = now
+    return True
 
 
 # ----------------------------
