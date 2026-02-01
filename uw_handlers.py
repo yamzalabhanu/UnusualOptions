@@ -43,7 +43,6 @@ from uw_core import (
     summarize_darkpool,
     stable_fingerprint,
     market_hours_ok_now,
-
     # ✅ async/persistent gates
     cooldown_ok_async,
     cooldown_ok_ticker_dir_async,
@@ -747,11 +746,8 @@ async def handle_custom_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> N
     if not market_hours_ok_now():
         return
 
-    # (Custom alerts can remain simple; add redis gates later if you want)
     key = "alert:" + alert_key(a)
 
-    # keep old in-memory cooldown if you want (or upgrade later)
-    # NOTE: we intentionally didn't force redis here because payloads vary a lot.
     now = now_utc()
     last = state.cooldown.get(key)
     if last and (now - last).total_seconds() < COOLDOWN_SECONDS:
