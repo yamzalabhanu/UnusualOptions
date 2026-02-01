@@ -7,10 +7,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 from collections import OrderedDict
-import redis.asyncio as redis
-
 
 import httpx
+import redis.asyncio as redis
 from zoneinfo import ZoneInfo
 
 # ----------------------------
@@ -63,15 +62,13 @@ DEDUP_MAX_KEYS = int(os.getenv("DEDUP_MAX_KEYS", "20000"))
 CROSS_STREAM_SUPPRESS_SECONDS = int(os.getenv("CROSS_STREAM_SUPPRESS_SECONDS", "1800"))
 
 # Per-cycle caps (Top-N sending)
-FLOW_MAX_SEND_PER_CYCLE = int(os.getenv("FLOW_MAX_SEND_PER_CYCLE", "5"))
-CHAINS_MAX_SEND_PER_CYCLE = int(os.getenv("CHAINS_MAX_SEND_PER_CYCLE", "8"))
+FLOW_MAX_SEND_PER_CYCLE = int(os.getenv("FLOW_MAX_SEND_PER_CYCLE", "3"))
+CHAINS_MAX_SEND_PER_CYCLE = int(os.getenv("CHAINS_MAX_SEND_PER_CYCLE", "6"))
 
 # Redis (optional but recommended)
 REDIS_URL = (os.getenv("REDIS_URL", "") or "").strip()
 REDIS_PREFIX = (os.getenv("REDIS_PREFIX", "uw") or "uw").strip()
 REDIS_ENABLED = bool(REDIS_URL)
-FLOW_MAX_SEND_PER_CYCLE = int(os.getenv("FLOW_MAX_SEND_PER_CYCLE", "3"))
-CHAINS_MAX_SEND_PER_CYCLE = int(os.getenv("CHAINS_MAX_SEND_PER_CYCLE", "6"))
 
 ENABLE_CUSTOM_ALERTS_FEED = os.getenv("ENABLE_CUSTOM_ALERTS_FEED", "0") == "1"
 
@@ -125,7 +122,6 @@ def require_env() -> None:
         missing.append("TELEGRAM_CHAT_ID")
     if missing:
         raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
-
     log.info("UW auth configured: token_present=%s token_len=%d", bool(UW_TOKEN), len(UW_TOKEN or ""))
 
 def bearerize(token: str) -> str:
@@ -146,10 +142,6 @@ def now_et() -> datetime:
     return datetime.now(tz=ET)
 
 def market_hours_ok_now() -> bool:
-    """
-    True only during 9:30am–4:00pm ET, Mon–Fri.
-    NOTE: does NOT account for US market holidays/half-days.
-    """
     t = now_et()
     if t.weekday() >= 5:
         return False
@@ -235,7 +227,6 @@ async def redis_client():
         return None
     if _redis is None:
         try:
-            import redis.asyncio as redis  # pip install "redis>=4.2"
             _redis = redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
         except Exception as e:
             log.error("Redis init failed: %s", e)
@@ -246,10 +237,6 @@ def _rk(kind: str, key: str) -> str:
     return f"{REDIS_PREFIX}:{kind}:{key}"
 
 async def redis_setnx_ttl(kind: str, key: str, ttl_seconds: int) -> bool:
-    """
-    Atomic: set key if not exists, with TTL.
-    Return True if newly set (allowed), False if already existed (duplicate).
-    """
     r = await redis_client()
     if not r:
         return True
@@ -275,10 +262,6 @@ async def redis_touch_ttl(kind: str, key: str, ttl_seconds: int) -> None:
 # Async gates (Redis-first + in-mem)
 # ----------------------------
 async def dedupe_event_async(key: str) -> bool:
-    """
-    Return True if we should SEND; False if duplicate.
-    Redis-first for persistence, in-memory also prevents very fast repeats.
-    """
     ok = await redis_setnx_ttl("dedupe", key, DEDUP_TTL_SECONDS)
     if not ok:
         return False
@@ -290,10 +273,6 @@ async def dedupe_event_async(key: str) -> bool:
     return True
 
 async def suppress_contract_async(contract: str) -> bool:
-    """
-    Cross-stream suppression by contract (Flow vs Chain), persistent with Redis.
-    Return True if allowed, False if suppressed.
-    """
     c = normalize_contract(contract)
     if not c:
         return True
@@ -309,10 +288,7 @@ async def suppress_contract_async(contract: str) -> bool:
     return True
 
 async def cooldown_ok_async(key: str, seconds: int) -> bool:
-    """
-    Persistent cooldown with Redis + in-memory.
-    IMPORTANT: check in-memory first so we don't "burn" Redis keys unnecessarily.
-    """
+    # check memory first (don’t burn redis keys)
     now = now_utc()
     last = state.cooldown.get(key)
     if last and (now - last).total_seconds() < seconds:
@@ -455,7 +431,7 @@ __all__ = [
     "uw_get", "get_market_tide", "get_darkpool_for_ticker", "summarize_darkpool",
 
     # gates
-    "cooldown_ok",                # legacy sync
+    "cooldown_ok",  # legacy sync
     "cooldown_ok_async",
     "cooldown_ok_ticker_dir_async",
     "dedupe_event_async",
