@@ -70,6 +70,8 @@ CHAINS_MAX_SEND_PER_CYCLE = int(os.getenv("CHAINS_MAX_SEND_PER_CYCLE", "8"))
 REDIS_URL = (os.getenv("REDIS_URL", "") or "").strip()
 REDIS_PREFIX = (os.getenv("REDIS_PREFIX", "uw") or "uw").strip()
 REDIS_ENABLED = bool(REDIS_URL)
+FLOW_MAX_SEND_PER_CYCLE = int(os.getenv("FLOW_MAX_SEND_PER_CYCLE", "3"))
+CHAINS_MAX_SEND_PER_CYCLE = int(os.getenv("CHAINS_MAX_SEND_PER_CYCLE", "6"))
 
 ENABLE_CUSTOM_ALERTS_FEED = os.getenv("ENABLE_CUSTOM_ALERTS_FEED", "0") == "1"
 
