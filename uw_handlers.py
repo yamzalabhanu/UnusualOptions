@@ -337,7 +337,8 @@ def _daily_cache_set(key: str, val: Dict[str, Any], ttl: int) -> None:
     _daily_cache[key] = (time.time() + ttl, val)
 
 
-async def get_daily_context_cached(ticker: str) -> Optional[Dict[str, Any]]:
+async def get_daily_context_cached(ticker: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
+
     if not POLYGON_API_KEY:
         return None
     k = f"daily:{ticker}"
@@ -345,9 +346,10 @@ async def get_daily_context_cached(ticker: str) -> Optional[Dict[str, Any]]:
     if cached:
         return cached
     try:
-        ctx = await compute_daily_context(
-            symbol=ticker,
-            api_key=POLYGON_API_KEY,
+       ctx = await compute_daily_context(
+    symbol=ticker,
+    api_key=POLYGON_API_KEY,
+    client=client,
             ema_periods=(9, 21, 50),
             swing_lookback=DAILY_TECH_SWING_LOOKBACK,
             avwap_anchor_lookback=DAILY_TECH_AVWAP_LOOKBACK,
@@ -556,7 +558,8 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
     bias = market_bias_from_tide(tide)
 
     # ✅ Daily technicals (cached)
-    daily_ctx = await get_daily_context_cached(ticker)
+
+    daily_ctx = await get_daily_context_cached(ticker, client)
 
     tier, tier_reason = recommendation_tier(
         opt_type=opt_type,
@@ -756,7 +759,7 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
     bias = market_bias_from_tide(tide)
 
     # ✅ Daily technicals (cached once per ticker per scan)
-    daily_ctx = await get_daily_context_cached(ticker)
+    daily_ctx = await get_daily_context_cached(ticker, client)
 
     sent = 0
 
