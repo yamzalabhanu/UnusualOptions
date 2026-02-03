@@ -4,6 +4,8 @@ import os
 import httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
+from daily_report import daily_report_loop
+
 
 from uw_core import (
     require_env, state, UW_BASE_URL, WATCHLIST, DEFAULT_WATCHLIST,
@@ -52,6 +54,8 @@ async def start_loops():
 
     ensure_task("flow_loop", flow_loop())
     ensure_task("chains_loop", chains_loop())
+    asyncio.create_task(daily_report_loop())
+
     if ENABLE_CUSTOM_ALERTS_FEED:
         ensure_task("custom_alerts_loop", custom_alerts_loop())
 
@@ -63,7 +67,6 @@ async def stop_loops():
     # cancel in parallel
     await asyncio.gather(*[_cancel_task(t) for t in tasks.values()], return_exceptions=True)
     tasks.clear()
-
 
 async def lifespan(app: FastAPI):
     require_env()
