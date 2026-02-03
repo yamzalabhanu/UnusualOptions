@@ -9,6 +9,8 @@ import time
 from datetime import date
 from typing import Any, Dict, List, Tuple, Optional
 
+from zoneinfo import ZoneInfo
+
 import httpx
 
 from uw_core import (
@@ -53,10 +55,11 @@ from uw_core import (
     suppress_contract_async,
 )
 
+# We will still keep GPT formatter available for /format endpoint or other uses,
+# but for FLOW/CHAIN alerts we use telegram_send directly to preserve DailyTech.
 from chatgpt import send_via_gpt_formatter, telegram_send
 
 # ✅ Daily technicals (EMA/AVWAP/Fib) helper module
-# You must create technicals_daily.py as provided earlier.
 from technicals_daily import compute_daily_context
 
 log = logging.getLogger("uw_app.handlers")
@@ -76,6 +79,36 @@ POLYGON_API_KEY = (os.getenv("POLYGON_API_KEY", "") or "").strip()
 DAILY_TECH_TTL_SECONDS = int(os.getenv("DAILY_TECH_TTL_SECONDS", "1800"))  # 30 min
 DAILY_TECH_SWING_LOOKBACK = int(os.getenv("DAILY_TECH_SWING_LOOKBACK", "60"))
 DAILY_TECH_AVWAP_LOOKBACK = int(os.getenv("DAILY_TECH_AVWAP_LOOKBACK", "60"))
+
+# ✅ Daily summary recording timezone
+CT = ZoneInfo("America/Chicago")
+
+# ============================================================
+# Daily report accumulator (records sent alerts in-memory)
+# Requires uw_core.state to have:
+#   state.daily_alert_date
+#   state.daily_alerts
+# ============================================================
+
+def record_daily_alert(kind: str, payload: Dict[str, Any]) -> None:
+    """
+    Collect today's alerts for the 2:55pm CT daily summary.
+    Safe if state doesn't have attributes yet (will create them).
+    """
+    today_ct = now_utc().astimezone(CT).date()
+
+    if not hasattr(state, "daily_alert_date"):
+        state.daily_alert_date = None
+    if not hasattr(state, "daily_alerts"):
+        state.daily_alerts = []
+
+    if state.daily_alert_date != today_ct:
+        state.daily_alert_date = today_ct
+        state.daily_alerts = []
+
+    payload = dict(payload or {})
+    payload["kind"] = kind
+    state.daily_alerts.append(payload)
 
 
 # ============================================================
@@ -347,7 +380,6 @@ async def get_daily_context_cached(ticker: str, client: httpx.AsyncClient) -> Op
         return cached
 
     try:
-        # ✅ FIXED INDENTATION + CLEAN CALL SHAPE
         ctx = await compute_daily_context(
             symbol=ticker,
             api_key=POLYGON_API_KEY,
@@ -384,10 +416,8 @@ def format_daily_context_line(ctx: Dict[str, Any]) -> str:
 
         nlevel = near.get("level", "n/a")
         ndist = _as_float(near.get("dist_pct"), None)
-
         ndist_s = "n/a" if ndist is None else f"{ndist:.2f}%"
 
-        # Keep this line compact for token usage
         return (
             f"• DailyTech: bias=`{bias}` | EMA9/21/50=`{_fmt2(ema9)}/{_fmt2(ema21)}/{_fmt2(ema50)}` "
             f"| AVWAP=`{_fmt2(avwap)}` | FibNear=`{nlevel}` ({ndist_s})"
@@ -598,7 +628,7 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
     )
     tier2 = apply_tier_downgrade(tier, downgrade_steps)
 
-    # ✅ Daily conflict downgrade (optional but recommended)
+    # ✅ Daily conflict downgrade
     conf_steps = daily_conflict_steps(daily_ctx, opt_type)
     tier3 = apply_tier_downgrade(tier2, conf_steps)
 
@@ -624,7 +654,24 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
         f"• Time: `{f.get('created_at')}`",
     ]
 
-    await send_via_gpt_formatter("\n".join(lines), client)
+    msg = "\n".join(lines)
+
+    # ✅ SEND RAW TO TELEGRAM so DailyTech is never dropped by GPT formatting
+    await telegram_send(msg, client)
+
+    # ✅ record for daily summary
+    record_daily_alert(
+        "FLOW",
+        {
+            "ticker": ticker,
+            "opt_type": opt_type,
+            "premium": float(prem or 0.0),
+            "strength10": int(strength10),
+            "score": int(score),
+            "tier": tier3,
+            "time": f.get("created_at"),
+        },
+    )
 
     if f.get("created_at"):
         state.flow_newer_than = f["created_at"]
@@ -847,7 +894,25 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
             f"• Time: `{now_utc().isoformat()}`",
         ]
 
-        await send_via_gpt_formatter("\n".join(lines), client)
+        msg = "\n".join(lines)
+
+        # ✅ SEND RAW TO TELEGRAM so DailyTech is never dropped by GPT formatting
+        await telegram_send(msg, client)
+
+        # ✅ record for daily summary
+        record_daily_alert(
+            "CHAIN",
+            {
+                "ticker": ticker,
+                "opt_type": opt_type,
+                "premium": float(prem or 0.0),
+                "strength10": int(strength10),
+                "tier": tier3,
+                "contract": contract,
+                "time": now_utc().isoformat(),
+            },
+        )
+
         sent += 1
 
     return sent
@@ -907,7 +972,22 @@ async def handle_custom_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> N
         f"• Payload: `{json.dumps(a)[:1500]}`",
         f"• Time: `{ts}`",
     ]
-    await telegram_send("\n".join(lines), client)
+
+    msg = "\n".join(lines)
+    await telegram_send(msg, client)
+
+    # record for daily summary too (optional)
+    record_daily_alert(
+        "CUSTOM",
+        {
+            "ticker": (sym or "UNK").upper(),
+            "opt_type": "n/a",
+            "premium": 0.0,
+            "strength10": 0,
+            "tier": "n/a",
+            "time": ts,
+        },
+    )
 
     if ts:
         state.alerts_newer_than = ts
