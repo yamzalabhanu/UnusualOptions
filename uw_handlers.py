@@ -338,27 +338,35 @@ def _daily_cache_set(key: str, val: Dict[str, Any], ttl: int) -> None:
 
 
 async def get_daily_context_cached(ticker: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-
     if not POLYGON_API_KEY:
         return None
+
     k = f"daily:{ticker}"
     cached = _daily_cache_get(k)
     if cached:
         return cached
+
     try:
-       ctx = await compute_daily_context(
-    symbol=ticker,
-    api_key=POLYGON_API_KEY,
-    client=client,
+        # ✅ FIXED INDENTATION + CLEAN CALL SHAPE
+        ctx = await compute_daily_context(
+            symbol=ticker,
+            api_key=POLYGON_API_KEY,
+            client=client,
             ema_periods=(9, 21, 50),
             swing_lookback=DAILY_TECH_SWING_LOOKBACK,
             avwap_anchor_lookback=DAILY_TECH_AVWAP_LOOKBACK,
         )
-        _daily_cache_set(k, ctx, DAILY_TECH_TTL_SECONDS)
-        return ctx
+        if isinstance(ctx, dict) and ctx:
+            _daily_cache_set(k, ctx, DAILY_TECH_TTL_SECONDS)
+            return ctx
+        return None
     except Exception as e:
         log.info("daily_context_failed %s: %s", ticker, e)
         return None
+
+
+def _fmt2(x: Optional[float]) -> str:
+    return "n/a" if x is None else f"{x:.2f}"
 
 
 def format_daily_context_line(ctx: Dict[str, Any]) -> str:
@@ -374,13 +382,15 @@ def format_daily_context_line(ctx: Dict[str, Any]) -> str:
         ema50 = _as_float(ema.get("ema50"), None)
         avwap = _as_float(av.get("value"), None)
 
-        nlevel = near.get("level")
+        nlevel = near.get("level", "n/a")
         ndist = _as_float(near.get("dist_pct"), None)
+
+        ndist_s = "n/a" if ndist is None else f"{ndist:.2f}%"
 
         # Keep this line compact for token usage
         return (
-            f"• DailyTech: bias=`{bias}` | EMA9/21/50=`{ema9:.2f}/{ema21:.2f}/{ema50:.2f}` "
-            f"| AVWAP=`{avwap:.2f}` | FibNear=`{nlevel}` ({ndist:.2f}%)"
+            f"• DailyTech: bias=`{bias}` | EMA9/21/50=`{_fmt2(ema9)}/{_fmt2(ema21)}/{_fmt2(ema50)}` "
+            f"| AVWAP=`{_fmt2(avwap)}` | FibNear=`{nlevel}` ({ndist_s})"
         )
     except Exception:
         return "• DailyTech: n/a"
@@ -558,7 +568,6 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
     bias = market_bias_from_tide(tide)
 
     # ✅ Daily technicals (cached)
-
     daily_ctx = await get_daily_context_cached(ticker, client)
 
     tier, tier_reason = recommendation_tier(
