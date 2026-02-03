@@ -12,6 +12,10 @@ import httpx
 import redis.asyncio as redis
 from zoneinfo import ZoneInfo
 
+from dataclasses import dataclass, field
+from datetime import date
+from typing import Any, Dict, List
+
 # ----------------------------
 # LOG
 # ----------------------------
@@ -106,6 +110,9 @@ class State:
     # Cross-module in-memory dedupe caches
     sent_cache: "OrderedDict[str, float]" = field(default_factory=OrderedDict)
     sent_contract_cache: "OrderedDict[str, float]" = field(default_factory=OrderedDict)
+
+    daily_alert_date: date | None = None
+    daily_alerts: List[Dict[str, Any]] = field(default_factory=list)
 
 state = State()
 
