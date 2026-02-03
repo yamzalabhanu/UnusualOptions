@@ -1,8 +1,11 @@
+# uw_handlers.py
 import asyncio
 import json
 import logging
 import math
+import os
 import re
+import time
 from datetime import date
 from typing import Any, Dict, List, Tuple, Optional
 
@@ -52,6 +55,10 @@ from uw_core import (
 
 from chatgpt import send_via_gpt_formatter, telegram_send
 
+# ✅ Daily technicals (EMA/AVWAP/Fib) helper module
+# You must create technicals_daily.py as provided earlier.
+from technicals_daily import compute_daily_context
+
 log = logging.getLogger("uw_app.handlers")
 
 # ============================================================
@@ -63,6 +70,12 @@ VERY_LARGE_PREMIUM_USD = 2_000_000
 MARKET_TIDE_NOTIONAL_THRESHOLD = 25_000_000
 DAY_TRADE_MAX_DTE = 7
 TICKER_DIR_COOLDOWN_SECONDS = 900
+
+# ✅ Daily technicals config
+POLYGON_API_KEY = (os.getenv("POLYGON_API_KEY", "") or "").strip()
+DAILY_TECH_TTL_SECONDS = int(os.getenv("DAILY_TECH_TTL_SECONDS", "1800"))  # 30 min
+DAILY_TECH_SWING_LOOKBACK = int(os.getenv("DAILY_TECH_SWING_LOOKBACK", "60"))
+DAILY_TECH_AVWAP_LOOKBACK = int(os.getenv("DAILY_TECH_AVWAP_LOOKBACK", "60"))
 
 
 # ============================================================
@@ -303,6 +316,92 @@ def recommendation_tier(
 
 
 # ============================================================
+# Daily technicals cache + formatter
+# ============================================================
+
+_daily_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+
+def _daily_cache_get(key: str) -> Optional[Dict[str, Any]]:
+    item = _daily_cache.get(key)
+    if not item:
+        return None
+    exp, val = item
+    if time.time() > exp:
+        _daily_cache.pop(key, None)
+        return None
+    return val
+
+
+def _daily_cache_set(key: str, val: Dict[str, Any], ttl: int) -> None:
+    _daily_cache[key] = (time.time() + ttl, val)
+
+
+async def get_daily_context_cached(ticker: str) -> Optional[Dict[str, Any]]:
+    if not POLYGON_API_KEY:
+        return None
+    k = f"daily:{ticker}"
+    cached = _daily_cache_get(k)
+    if cached:
+        return cached
+    try:
+        ctx = await compute_daily_context(
+            symbol=ticker,
+            api_key=POLYGON_API_KEY,
+            ema_periods=(9, 21, 50),
+            swing_lookback=DAILY_TECH_SWING_LOOKBACK,
+            avwap_anchor_lookback=DAILY_TECH_AVWAP_LOOKBACK,
+        )
+        _daily_cache_set(k, ctx, DAILY_TECH_TTL_SECONDS)
+        return ctx
+    except Exception as e:
+        log.info("daily_context_failed %s: %s", ticker, e)
+        return None
+
+
+def format_daily_context_line(ctx: Dict[str, Any]) -> str:
+    try:
+        bias = str(ctx.get("trend_bias") or "n/a")
+        ema = ctx.get("ema", {}) or {}
+        av = ctx.get("avwap", {}) or {}
+        fib = ctx.get("fib", {}) or {}
+        near = (fib.get("nearest") or {}) if isinstance(fib, dict) else {}
+
+        ema9 = _as_float(ema.get("ema9"), None)
+        ema21 = _as_float(ema.get("ema21"), None)
+        ema50 = _as_float(ema.get("ema50"), None)
+        avwap = _as_float(av.get("value"), None)
+
+        nlevel = near.get("level")
+        ndist = _as_float(near.get("dist_pct"), None)
+
+        # Keep this line compact for token usage
+        return (
+            f"• DailyTech: bias=`{bias}` | EMA9/21/50=`{ema9:.2f}/{ema21:.2f}/{ema50:.2f}` "
+            f"| AVWAP=`{avwap:.2f}` | FibNear=`{nlevel}` ({ndist:.2f}%)"
+        )
+    except Exception:
+        return "• DailyTech: n/a"
+
+
+def daily_conflict_steps(daily_ctx: Optional[Dict[str, Any]], opt_type: str) -> int:
+    """
+    Simple downgrade if daily tape fights the option direction.
+    CALL vs bearish daily => -1 tier
+    PUT vs bullish daily => -1 tier
+    """
+    if not daily_ctx:
+        return 0
+    bias = str(daily_ctx.get("trend_bias") or "neutral").lower()
+    opt = str(opt_type or "").upper()
+    if opt == "CALL" and bias == "bearish":
+        return 1
+    if opt == "PUT" and bias == "bullish":
+        return 1
+    return 0
+
+
+# ============================================================
 # Flow helpers
 # ============================================================
 
@@ -456,6 +555,9 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
     dp = await get_darkpool_for_ticker(client, ticker)
     bias = market_bias_from_tide(tide)
 
+    # ✅ Daily technicals (cached)
+    daily_ctx = await get_daily_context_cached(ticker)
+
     tier, tier_reason = recommendation_tier(
         opt_type=opt_type,
         strength10=strength10,
@@ -484,16 +586,26 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
     )
     tier2 = apply_tier_downgrade(tier, downgrade_steps)
 
+    # ✅ Daily conflict downgrade (optional but recommended)
+    conf_steps = daily_conflict_steps(daily_ctx, opt_type)
+    tier3 = apply_tier_downgrade(tier2, conf_steps)
+
     horizon = trade_horizon_label(contract)
 
     lines = [
         f"🚨 *UW Flow Alert* — *{ticker}* | *Strength:* `{strength10}/10` | *Score:* `{score}/100`",
-        f"• Recommendation: *{tier2}* (base={tier}, -{downgrade_steps}) | BiasPref: `{('CALL' if bias=='UP' else 'PUT') if bias in ('UP','DOWN') else 'MIXED'}` | Horizon: *{horizon}*",
+        f"• Recommendation: *{tier3}* (base={tier}, complexity=-{downgrade_steps}, daily=-{conf_steps}) | BiasPref: `{('CALL' if bias=='UP' else 'PUT') if bias in ('UP','DOWN') else 'MIXED'}` | Horizon: *{horizon}*",
         f"• FlowType: `{flowtype_reason}`",
         f"• Type/Side: `{opt_type}` / `{str(f.get('side') or 'n/a')}` | Rule: `{f.get('rule')}`",
         f"• Contract: `{contract or 'n/a'}`",
         f"• Premium: *{money(prem)}* ({premium_bucket_label(prem)}) | Vol/OI: `{f.get('vol_oi')}` | Δ: `{f.get('delta')}`",
         f"• Vol: `{vol}` | OI: `{oi}` | Underlying: `{f.get('underlying')}`",
+    ]
+
+    if daily_ctx:
+        lines.append(format_daily_context_line(daily_ctx))
+
+    lines += [
         f"• MarketTide: {summarize_market_tide_compact(tide)}",
         f"• Darkpool: {summarize_darkpool(dp)}",
         f"• Model: `{tier_reason}`",
@@ -643,6 +755,9 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
     dp = await get_darkpool_for_ticker(client, ticker)
     bias = market_bias_from_tide(tide)
 
+    # ✅ Daily technicals (cached once per ticker per scan)
+    daily_ctx = await get_daily_context_cached(ticker)
+
     sent = 0
 
     for prem, f, reasons in top:
@@ -693,17 +808,27 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         )
         tier2 = apply_tier_downgrade(tier, downgrade_steps)
 
+        # ✅ Daily conflict downgrade
+        conf_steps = daily_conflict_steps(daily_ctx, opt_type)
+        tier3 = apply_tier_downgrade(tier2, conf_steps)
+
         horizon = trade_horizon_label(contract)
 
         lines = [
             f"🔥 *UW Unusual Chain* — *{ticker}* | *Strength:* `{strength10}/10`",
-            f"• Recommendation: *{tier2}* (base={tier}, -{downgrade_steps}) | BiasPref: `{('CALL' if bias=='UP' else 'PUT') if bias in ('UP','DOWN') else 'MIXED'}` | Horizon: *{horizon}*",
+            f"• Recommendation: *{tier3}* (base={tier}, complexity=-{downgrade_steps}, daily=-{conf_steps}) | BiasPref: `{('CALL' if bias=='UP' else 'PUT') if bias in ('UP','DOWN') else 'MIXED'}` | Horizon: *{horizon}*",
             f"• FlowType: `{flowtype_reason}`",
             f"• Contract: `{contract}` | Type: `{opt_type}`",
             f"• Premium: *{money(prem)}* ({premium_bucket_label(prem)}) | AvgPx: `{f.get('avg_price')}` | IV: `{f.get('iv')}`",
             f"• Vol: `{vol}` | OI: `{oi}` | PrevOI: `{prev_oi}` | OIΔ: `{oi_chg}` | Vol/OI: `{voloi}`",
             f"• AskVol: `{f.get('ask_volume')}` | BidVol: `{f.get('bid_volume')}` | Sweeps: `{f.get('sweep_volume')}` | MultiLeg: `{f.get('multi_leg_volume')}`",
             f"• Triggers: `{', '.join(reasons)}`",
+        ]
+
+        if daily_ctx:
+            lines.append(format_daily_context_line(daily_ctx))
+
+        lines += [
             f"• MarketTide: {summarize_market_tide_compact(tide)}",
             f"• Darkpool: {summarize_darkpool(dp)}",
             f"• Model: `{tier_reason}`",
