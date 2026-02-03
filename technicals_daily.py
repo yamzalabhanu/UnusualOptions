@@ -1,11 +1,11 @@
 # technicals_daily.py
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple, Optional
 
+import asyncio
 import httpx
 
 
@@ -87,37 +87,60 @@ def _nearest_level(price: float, levels: Dict[str, float]) -> Dict[str, float]:
     return {"level": float(best_k), "price": float(best_p), "dist_pct": float(dist_pct)}
 
 
-async def fetch_daily_polygon(symbol: str, api_key: str, lookback_days: int = 240) -> List[DailyBar]:
-    # Daily aggregates from Polygon
+async def fetch_daily_polygon(
+    symbol: str,
+    api_key: str,
+    lookback_days: int = 240,
+    client: Optional[httpx.AsyncClient] = None,
+    retries: int = 2,
+) -> List[DailyBar]:
+    """
+    Fetch Polygon daily aggregates.
+    If client is provided, it is reused (recommended).
+    """
     end = datetime.now(timezone.utc).date()
     start = end.fromordinal(end.toordinal() - lookback_days)
 
     url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/{start.isoformat()}/{end.isoformat()}"
     params = {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": api_key}
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(url, params=params)
+    async def _do_get(c: httpx.AsyncClient):
+        r = await c.get(url, params=params)
         r.raise_for_status()
-        j = r.json()
+        return r.json()
 
-    rows = j.get("results") or []
-    bars: List[DailyBar] = []
-    for x in rows:
+    last_err: Optional[Exception] = None
+    for attempt in range(retries + 1):
         try:
-            bars.append(
-                DailyBar(
-                    t=int(x["t"]),
-                    o=float(x["o"]),
-                    h=float(x["h"]),
-                    l=float(x["l"]),
-                    c=float(x["c"]),
-                    v=float(x.get("v", 0.0) or 0.0),
-                )
-            )
-        except Exception:
-            continue
+            if client is not None:
+                j = await _do_get(client)
+            else:
+                async with httpx.AsyncClient(timeout=20) as c:
+                    j = await _do_get(c)
 
-    return bars
+            rows = j.get("results") or []
+            bars: List[DailyBar] = []
+            for x in rows:
+                try:
+                    bars.append(
+                        DailyBar(
+                            t=int(x["t"]),
+                            o=float(x["o"]),
+                            h=float(x["h"]),
+                            l=float(x["l"]),
+                            c=float(x["c"]),
+                            v=float(x.get("v", 0.0) or 0.0),
+                        )
+                    )
+                except Exception:
+                    continue
+            return bars
+        except Exception as e:
+            last_err = e
+            # simple backoff
+            await asyncio.sleep(0.25 * (2**attempt))
+
+    raise last_err or RuntimeError("fetch_daily_polygon failed")
 
 
 async def compute_daily_context(
@@ -126,8 +149,9 @@ async def compute_daily_context(
     ema_periods: Tuple[int, int, int] = (9, 21, 50),
     swing_lookback: int = 60,
     avwap_anchor_lookback: int = 60,
+    client: Optional[httpx.AsyncClient] = None,  # ✅ reuse your existing client
 ) -> Dict[str, object]:
-    bars = await fetch_daily_polygon(symbol, api_key, lookback_days=240)
+    bars = await fetch_daily_polygon(symbol, api_key, lookback_days=240, client=client)
     if len(bars) < max(ema_periods) + 5:
         raise ValueError(f"not enough daily bars for {symbol}: {len(bars)}")
 
@@ -145,7 +169,7 @@ async def compute_daily_context(
     anchor_idx = max(0, len(bars) - avwap_anchor_lookback)
     avwap = float(_anchored_vwap_daily(bars, anchor_idx))
 
-    swing_low, swing_high, low_idx, high_idx = _pick_swing_high_low(bars, lookback=swing_lookback)
+    swing_low, swing_high, _, _ = _pick_swing_high_low(bars, lookback=swing_lookback)
     fibs = _fib_levels(swing_low, swing_high)
     near = _nearest_level(last, fibs)
 
