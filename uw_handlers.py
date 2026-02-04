@@ -6,9 +6,8 @@ import math
 import os
 import re
 import time
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Tuple, Optional
-
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -80,8 +79,12 @@ DAILY_TECH_TTL_SECONDS = int(os.getenv("DAILY_TECH_TTL_SECONDS", "1800"))  # 30 
 DAILY_TECH_SWING_LOOKBACK = int(os.getenv("DAILY_TECH_SWING_LOOKBACK", "60"))
 DAILY_TECH_AVWAP_LOOKBACK = int(os.getenv("DAILY_TECH_AVWAP_LOOKBACK", "60"))
 
-# ✅ Daily summary recording timezone
-CT = ZoneInfo("America/Chicago")
+# ✅ Daily summary recording timezone + schedule
+CT = ZoneInfo(os.getenv("LOCAL_TZ", "America/Chicago"))
+DAILY_REPORT_ENABLED = os.getenv("DAILY_REPORT_ENABLED", "1").strip() == "1"
+DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "14"))      # 2pm
+DAILY_REPORT_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", "55"))  # :55
+DAILY_REPORT_TOP_N = int(os.getenv("DAILY_REPORT_TOP_N", "12"))
 
 # ============================================================
 # Daily report accumulator (records sent alerts in-memory)
@@ -112,6 +115,143 @@ def record_daily_alert(kind: str, payload: Dict[str, Any]) -> None:
 
 
 # ============================================================
+# Daily report builder + scheduler (2:55pm CT)
+# ============================================================
+
+def _tier_rank(tier: str) -> int:
+    order = {"Strong Buy": 0, "Buy": 1, "Moderate Buy": 2, "Watch": 3}
+    return order.get(str(tier or ""), 9)
+
+def _money_compact(x: float) -> str:
+    try:
+        v = float(x or 0.0)
+    except Exception:
+        return "n/a"
+    if v >= 1_000_000_000:
+        return f"${v/1_000_000_000:.2f}B"
+    if v >= 1_000_000:
+        return f"${v/1_000_000:.2f}M"
+    if v >= 1_000:
+        return f"${v/1_000:.1f}K"
+    return f"${v:.0f}"
+
+def build_daily_report_text() -> str:
+    today_ct = now_utc().astimezone(CT).date()
+
+    if not hasattr(state, "daily_alert_date") or not hasattr(state, "daily_alerts"):
+        return f"Daily Alerts Report ({today_ct}) — 2:55pm CT\n\nNo alerts logged yet today."
+
+    if state.daily_alert_date != today_ct or not state.daily_alerts:
+        return f"Daily Alerts Report ({today_ct}) — 2:55pm CT\n\nNo alerts logged yet today."
+
+    rows: List[Dict[str, Any]] = list(state.daily_alerts or [])
+    total = len(rows)
+
+    by_kind: Dict[str, int] = {}
+    by_ticker: Dict[str, int] = {}
+    by_tier: Dict[str, int] = {}
+
+    for r in rows:
+        k = str(r.get("kind") or "UNK")
+        by_kind[k] = by_kind.get(k, 0) + 1
+
+        sym = str(r.get("ticker") or "UNK").upper()
+        by_ticker[sym] = by_ticker.get(sym, 0) + 1
+
+        tier = str(r.get("tier") or "unknown")
+        by_tier[tier] = by_tier.get(tier, 0) + 1
+
+    def prem(r: Dict[str, Any]) -> float:
+        try:
+            return float(r.get("premium") or 0.0)
+        except Exception:
+            return 0.0
+
+    top_prem = sorted(rows, key=prem, reverse=True)[:DAILY_REPORT_TOP_N]
+    top_quality = sorted(rows, key=lambda r: (_tier_rank(r.get("tier")), -prem(r)))[:DAILY_REPORT_TOP_N]
+
+    top_tickers = sorted(by_ticker.items(), key=lambda x: -x[1])[:10]
+
+    lines: List[str] = []
+    lines.append(f"Daily Alerts Report ({today_ct}) — 2:55pm CT")
+    lines.append("")
+    lines.append(f"Total alerts: {total}")
+    lines.append("By type: " + ", ".join([f"{k}={v}" for k, v in sorted(by_kind.items(), key=lambda x: -x[1])]))
+    lines.append("By tier: " + ", ".join([f"{k}={v}" for k, v in sorted(by_tier.items(), key=lambda x: -x[1])]))
+    lines.append("Top tickers: " + ", ".join([f"{k}({v})" for k, v in top_tickers]))
+    lines.append("")
+
+    lines.append("Top by premium:")
+    for r in top_prem:
+        sym = str(r.get("ticker") or "UNK").upper()
+        kind = str(r.get("kind") or "UNK")
+        opt = str(r.get("opt_type") or "?")
+        tier = str(r.get("tier") or "?")
+        s10 = r.get("strength10")
+        pr = _money_compact(r.get("premium"))
+        contract = str(r.get("contract") or "")
+        short_contract = contract[-12:] if contract else ""
+        tm = str(r.get("time") or "n/a")
+        lines.append(f"- {sym} {kind} {opt} | {tier} | s={s10}/10 | prem={pr} | {short_contract} | t={tm}")
+
+    lines.append("")
+    lines.append("Best-quality (tier first):")
+    for r in top_quality:
+        sym = str(r.get("ticker") or "UNK").upper()
+        kind = str(r.get("kind") or "UNK")
+        opt = str(r.get("opt_type") or "?")
+        tier = str(r.get("tier") or "?")
+        s10 = r.get("strength10")
+        pr = _money_compact(r.get("premium"))
+        lines.append(f"- {sym} {kind} {opt} | {tier} | s={s10}/10 | prem={pr}")
+
+    return "\n".join(lines)
+
+async def daily_report_loop() -> None:
+    """
+    Sends daily summary at 2:55pm CT.
+    NOTE: This is in-memory; Render restarts will reset the day's log.
+    """
+    if not DAILY_REPORT_ENABLED:
+        log.info("daily_report_loop disabled (DAILY_REPORT_ENABLED=0)")
+        return
+
+    async with httpx.AsyncClient() as client:
+        while state.running:
+            now_ct = datetime.now(tz=CT)
+            target = now_ct.replace(
+                hour=DAILY_REPORT_HOUR,
+                minute=DAILY_REPORT_MINUTE,
+                second=0,
+                microsecond=0,
+            )
+
+            if now_ct >= target:
+                target = target + timedelta(days=1)
+
+            sleep_s = (target - now_ct).total_seconds()
+            while state.running and sleep_s > 0:
+                chunk = min(60.0, sleep_s)
+                await asyncio.sleep(chunk)
+                sleep_s -= chunk
+
+            if not state.running:
+                break
+
+            try:
+                text = build_daily_report_text()
+                await telegram_send(text, client)
+
+                # reset after sending (keep the date as "today" so fresh alerts repopulate)
+                today_ct = now_utc().astimezone(CT).date()
+                state.daily_alert_date = today_ct
+                state.daily_alerts = []
+            except Exception as e:
+                log.warning("daily_report_loop failed: %s", repr(e))
+                await asyncio.sleep(5)
+
+
+# ============================================================
 # Helpers
 # ============================================================
 
@@ -128,15 +268,12 @@ def _as_float(x: Any, default: Any = 0.0) -> Any:
     except Exception:
         return default
 
-
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
-
 
 def strength_10_from_score(score_100: int) -> int:
     score_100 = int(score_100 or 0)
     return max(0, min(10, int(math.ceil(score_100 / 10.0))))
-
 
 def parse_occ_expiry_from_contract(contract: str) -> Optional[date]:
     if not contract:
@@ -154,7 +291,6 @@ def parse_occ_expiry_from_contract(contract: str) -> Optional[date]:
     except Exception:
         return None
 
-
 def dte_from_contract(contract: str) -> Optional[int]:
     exp = parse_occ_expiry_from_contract(contract)
     if not exp:
@@ -162,13 +298,11 @@ def dte_from_contract(contract: str) -> Optional[int]:
     today = now_utc().date()
     return (exp - today).days
 
-
 def trade_horizon_label(contract: str) -> str:
     dte = dte_from_contract(contract)
     if dte is None:
         return "unknown horizon"
     return "day trade" if dte <= DAY_TRADE_MAX_DTE else "swing trade"
-
 
 def premium_bucket_label(prem: float) -> str:
     if prem >= 10_000_000:
@@ -180,7 +314,6 @@ def premium_bucket_label(prem: float) -> str:
     if prem >= 500_000:
         return "large"
     return "small"
-
 
 def market_bias_from_tide(tide: Any) -> str:
     if not isinstance(tide, dict):
@@ -202,7 +335,6 @@ def market_bias_from_tide(tide: Any) -> str:
         return "DOWN"
     return "MIXED"
 
-
 def summarize_market_tide_compact(tide: Any) -> str:
     if not isinstance(tide, dict) or not isinstance(tide.get("data"), list) or not tide["data"]:
         return "bias=MIXED"
@@ -214,12 +346,10 @@ def summarize_market_tide_compact(tide: Any) -> str:
     bias = market_bias_from_tide(tide)
     return f"bias={bias} | net={money(net)} call={money(call_net)} put={money(put_net)} | t={ts}"
 
-
 def multileg_ratio(multileg_vol: Optional[int], vol: int) -> Optional[float]:
     if multileg_vol is None or not vol or vol <= 0:
         return None
     return float(multileg_vol) / float(vol)
-
 
 def downgrade_steps_from_complexity(
     vol: int,
@@ -268,7 +398,6 @@ def downgrade_steps_from_complexity(
     expl = ", ".join(notes) if notes else "no complexity flags"
     return steps, f"{flowtype} | {expl}"
 
-
 def apply_tier_downgrade(tier: str, steps: int) -> str:
     order = ["Strong Buy", "Buy", "Moderate Buy", "Watch"]
     if tier not in order:
@@ -276,7 +405,6 @@ def apply_tier_downgrade(tier: str, steps: int) -> str:
     idx = order.index(tier)
     idx2 = min(len(order) - 1, idx + max(0, int(steps)))
     return order[idx2]
-
 
 def recommendation_tier(
     opt_type: str,
@@ -354,7 +482,6 @@ def recommendation_tier(
 
 _daily_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
-
 def _daily_cache_get(key: str) -> Optional[Dict[str, Any]]:
     item = _daily_cache.get(key)
     if not item:
@@ -365,10 +492,8 @@ def _daily_cache_get(key: str) -> Optional[Dict[str, Any]]:
         return None
     return val
 
-
 def _daily_cache_set(key: str, val: Dict[str, Any], ttl: int) -> None:
     _daily_cache[key] = (time.time() + ttl, val)
-
 
 async def get_daily_context_cached(ticker: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     if not POLYGON_API_KEY:
@@ -396,10 +521,8 @@ async def get_daily_context_cached(ticker: str, client: httpx.AsyncClient) -> Op
         log.info("daily_context_failed %s: %s", ticker, e)
         return None
 
-
 def _fmt2(x: Optional[float]) -> str:
     return "n/a" if x is None else f"{x:.2f}"
-
 
 def format_daily_context_line(ctx: Dict[str, Any]) -> str:
     try:
@@ -424,7 +547,6 @@ def format_daily_context_line(ctx: Dict[str, Any]) -> str:
         )
     except Exception:
         return "• DailyTech: n/a"
-
 
 def daily_conflict_steps(daily_ctx: Optional[Dict[str, Any]], opt_type: str) -> int:
     """
@@ -465,7 +587,6 @@ def get_flow_fields(a: Dict[str, Any]) -> Dict[str, Any]:
         "underlying": safe_float(a.get("underlying_price") or a.get("underlying") or a.get("stock_price") or a.get("spot_price")),
     }
 
-
 def score_flow_alert(f: Dict[str, Any]) -> int:
     score = 50
     prem = f.get("premium") or 0.0
@@ -498,7 +619,6 @@ def score_flow_alert(f: Dict[str, Any]) -> int:
 
     return max(0, min(100, score))
 
-
 async def fetch_flow_alerts(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     params: Dict[str, Any] = {
         "min_premium": MIN_FLOW_PREMIUM,
@@ -517,7 +637,6 @@ async def fetch_flow_alerts(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     rows = data.get("data") if isinstance(data, dict) else data
     return rows if isinstance(rows, list) else []
 
-
 def flow_alert_key(f: Dict[str, Any]) -> str:
     raw = "|".join(
         [
@@ -531,7 +650,6 @@ def flow_alert_key(f: Dict[str, Any]) -> str:
         ]
     )
     return sha16(raw)
-
 
 async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> bool:
     if not market_hours_ok_now():
@@ -669,6 +787,7 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
             "strength10": int(strength10),
             "score": int(score),
             "tier": tier3,
+            "contract": contract,
             "time": f.get("created_at"),
         },
     )
@@ -697,7 +816,6 @@ def chain_row_fields(r: Dict[str, Any]) -> Dict[str, Any]:
         "sweep_volume": safe_int(r.get("sweep_volume")),
         "multi_leg_volume": safe_int(r.get("multi_leg_volume")),
     }
-
 
 def chain_is_unusual(f: Dict[str, Any]) -> Tuple[bool, List[str]]:
     vol = f.get("volume") or 0
@@ -732,7 +850,6 @@ def chain_is_unusual(f: Dict[str, Any]) -> Tuple[bool, List[str]]:
     real_triggers = [r for r in reasons if r.startswith(("prem>=", "vol/oi>=", "oi_chg>="))]
     return (len(real_triggers) > 0), reasons
 
-
 def chain_strength_10(prem: float, vol: int, oi: int, voloi: Optional[float], oi_chg: Optional[int]) -> int:
     s = 4
     if prem >= 10_000_000:
@@ -766,7 +883,6 @@ def chain_strength_10(prem: float, vol: int, oi: int, voloi: Optional[float], oi
         s += 1
     return max(0, min(10, s))
 
-
 def opt_type_from_contract(contract: str) -> str:
     if not contract:
         return "UNK"
@@ -774,7 +890,6 @@ def opt_type_from_contract(contract: str) -> str:
     if not m:
         return "UNK"
     return "CALL" if m.group(1) == "C" else "PUT"
-
 
 async def fetch_option_contracts(client: httpx.AsyncClient, ticker: str) -> List[Dict[str, Any]]:
     params: Dict[str, Any] = {"limit": 500, "exclude_zero_vol_chains": "true", "exclude_zero_oi_chains": "true"}
@@ -784,7 +899,6 @@ async def fetch_option_contracts(client: httpx.AsyncClient, ticker: str) -> List
     data = await uw_get(client, f"/api/stock/{ticker}/option-contracts", params=params)
     rows = data.get("data") if isinstance(data, dict) else data
     return rows if isinstance(rows, list) else []
-
 
 async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str) -> int:
     if not market_hours_ok_now():
@@ -930,7 +1044,6 @@ async def fetch_custom_alerts(client: httpx.AsyncClient) -> List[Dict[str, Any]]
     rows = data.get("data") if isinstance(data, dict) else data
     return rows if isinstance(rows, list) else []
 
-
 def alert_key(a: Dict[str, Any]) -> str:
     raw = "|".join(
         [
@@ -942,7 +1055,6 @@ def alert_key(a: Dict[str, Any]) -> str:
         ]
     )
     return sha16(raw)
-
 
 async def handle_custom_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> None:
     if not market_hours_ok_now():
@@ -1017,7 +1129,6 @@ async def flow_loop() -> None:
 
             await asyncio.sleep(FLOW_POLL_SECONDS)
 
-
 async def chains_loop() -> None:
     async with httpx.AsyncClient() as client:
         while state.running:
@@ -1032,7 +1143,6 @@ async def chains_loop() -> None:
                 pass
 
             await asyncio.sleep(CHAIN_POLL_SECONDS)
-
 
 async def custom_alerts_loop() -> None:
     async with httpx.AsyncClient() as client:
@@ -1051,4 +1161,4 @@ async def custom_alerts_loop() -> None:
             await asyncio.sleep(ALERTS_POLL_SECONDS)
 
 
-__all__ = ["flow_loop", "chains_loop", "custom_alerts_loop"]
+__all__ = ["flow_loop", "chains_loop", "custom_alerts_loop", "daily_report_loop"]
