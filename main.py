@@ -7,6 +7,8 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
+from daily_report import daily_report_loop  # ✅ correct import
+
 from uw_core import (
     require_env,
     state,
@@ -34,10 +36,9 @@ from uw_core import (
     get_darkpool_for_ticker,
 )
 
-# ✅ import daily report loop from uw_handlers (single source of truth)
-from uw_handlers import flow_loop, chains_loop, custom_alerts_loop, daily_report_loop
-
+from uw_handlers import flow_loop, chains_loop, custom_alerts_loop
 from chatgpt import gpt_rewrite_alert, telegram_send, send_via_gpt_formatter
+
 
 ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN", "") or "").strip()  # optional
 
@@ -62,9 +63,6 @@ async def start_loops():
     if getattr(state, "tasks", None) is None:
         state.tasks = {}
 
-    if state.running:
-        # already running; ensure tasks exist (in case of partial state)
-        pass
     state.running = True
 
     def ensure_task(name: str, coro):
@@ -75,11 +73,11 @@ async def start_loops():
     ensure_task("flow_loop", flow_loop())
     ensure_task("chains_loop", chains_loop())
 
+    # ✅ daily summary loop should also be tracked to prevent duplicates
+    ensure_task("daily_report_loop", daily_report_loop())
+
     if ENABLE_CUSTOM_ALERTS_FEED:
         ensure_task("custom_alerts_loop", custom_alerts_loop())
-
-    # ✅ schedule daily report loop (2:55pm CT)
-    ensure_task("daily_report_loop", daily_report_loop())
 
 
 async def stop_loops():
@@ -140,12 +138,6 @@ def health():
         "cooldown_seconds": COOLDOWN_SECONDS,
         "custom_alerts_feed_enabled": ENABLE_CUSTOM_ALERTS_FEED,
         "tasks": list(getattr(state, "tasks", {}).keys()),
-        "daily_report": {
-            "enabled": True,
-            "note": "Runs daily at 2:55pm America/Chicago (configurable via env in uw_handlers.py).",
-            "today_ct": str(getattr(state, "daily_alert_date", None)),
-            "alerts_logged_today": len(getattr(state, "daily_alerts", []) or []),
-        },
     }
 
 
@@ -226,7 +218,6 @@ def root():
             "/debug/market-tide",
             "/debug/darkpool/{ticker}",
             "/test/telegram",
-            "/format",
             "/control/start",
             "/control/stop",
             "/control/reset_cursors",
