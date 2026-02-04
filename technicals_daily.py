@@ -22,17 +22,14 @@ class DailyBar:
 def _ema(values: List[float], period: int) -> List[float]:
     if not values:
         return []
-    period = int(period)
     if period <= 1:
-        return [float(x) for x in values]
-
+        return values[:]
     alpha = 2.0 / (period + 1.0)
     out: List[float] = []
     cur = float(values[0])
     out.append(cur)
-
     for v in values[1:]:
-        cur = alpha * float(v) + (1.0 - alpha) * cur
+        cur = alpha * float(v) + (1 - alpha) * cur
         out.append(cur)
     return out
 
@@ -43,21 +40,17 @@ def _anchored_vwap_daily(bars: List[DailyBar], anchor_idx: int) -> float:
     """
     if not bars:
         return 0.0
-
     anchor_idx = max(0, min(int(anchor_idx), len(bars) - 1))
     num = 0.0
     den = 0.0
-
     for b in bars[anchor_idx:]:
-        tp = (float(b.h) + float(b.l) + float(b.c)) / 3.0
+        tp = (b.h + b.l + b.c) / 3.0
         vol = max(0.0, float(b.v))
         num += tp * vol
         den += vol
-
-    if den <= 0.0:
+    if den <= 0:
         last = bars[-1]
-        return (float(last.h) + float(last.l) + float(last.c)) / 3.0
-
+        return (last.h + last.l + last.c) / 3.0
     return num / den
 
 
@@ -84,13 +77,11 @@ def _pick_swing_high_low(bars: List[DailyBar], lookback: int = 60) -> Tuple[floa
 
 
 def _fib_levels(low: float, high: float) -> Dict[str, float]:
-    low = float(low)
+    diff = float(high) - float(low)
+    if diff <= 0:
+        base = float(low)
+        return {"0.382": base, "0.5": base, "0.618": base, "0.786": base}
     high = float(high)
-    diff = high - low
-
-    if diff <= 0.0:
-        return {"0.382": low, "0.5": low, "0.618": low, "0.786": low}
-
     return {
         "0.382": high - 0.382 * diff,
         "0.5": high - 0.5 * diff,
@@ -103,33 +94,40 @@ def _nearest_level(price: float, levels: Dict[str, float]) -> Dict[str, Any]:
     """
     Pick the nearest fib level by absolute distance to `price`.
 
-    IMPORTANT:
-      - "level" is returned as a STRING key like "0.382"
-      - "price" and "dist_pct" are numeric
+    IMPORTANT: "level" is returned as a STRING key like "0.382" (not float),
+    so upstream can display it safely. "price" and "dist_pct" are numeric.
     """
-    price = float(price or 0.0)
-
     best_k: Optional[str] = None
     best_d: Optional[float] = None
     best_p: Optional[float] = None
 
-    for k, p in (levels or {}).items():
+    price = float(price or 0.0)
+
+    for k, p in levels.items():
         try:
-            pp = float(p)
+            p = float(p)
         except Exception:
             continue
-
-        d = abs(price - pp)
+        d = abs(price - p)
         if best_d is None or d < best_d:
             best_d = d
             best_k = str(k)
-            best_p = pp
+            best_p = p
 
     if best_k is None or best_d is None or best_p is None:
         return {"level": "n/a", "price": 0.0, "dist_pct": 0.0}
 
     dist_pct = (best_d / price) * 100.0 if price else 0.0
     return {"level": best_k, "price": float(best_p), "dist_pct": float(dist_pct)}
+
+
+def _pct_dist(a: float, b: float) -> float:
+    # percent distance from a to b relative to a (a is "price-like")
+    a = float(a or 0.0)
+    b = float(b or 0.0)
+    if a == 0:
+        return 0.0
+    return (a - b) / a * 100.0
 
 
 async def fetch_daily_polygon(
@@ -146,9 +144,6 @@ async def fetch_daily_polygon(
     symbol = (symbol or "").upper().strip()
     if not symbol:
         return []
-
-    if not api_key:
-        raise RuntimeError("Missing Polygon api_key for fetch_daily_polygon")
 
     end = datetime.now(timezone.utc).date()
     start = end.fromordinal(end.toordinal() - int(lookback_days))
@@ -172,7 +167,6 @@ async def fetch_daily_polygon(
 
             rows = j.get("results") or []
             bars: List[DailyBar] = []
-
             for x in rows:
                 try:
                     bars.append(
@@ -187,9 +181,7 @@ async def fetch_daily_polygon(
                     )
                 except Exception:
                     continue
-
             return bars
-
         except Exception as e:
             last_err = e
             await asyncio.sleep(0.25 * (2**attempt))
@@ -205,12 +197,9 @@ async def compute_daily_context(
     avwap_anchor_lookback: int = 60,
     client: Optional[httpx.AsyncClient] = None,
 ) -> Dict[str, object]:
-    symbol = (symbol or "").upper().strip()
     bars = await fetch_daily_polygon(symbol, api_key, lookback_days=240, client=client)
-
-    need = max(int(p) for p in ema_periods) + 5
-    if len(bars) < need:
-        raise ValueError(f"not enough daily bars for {symbol}: {len(bars)} (need {need})")
+    if len(bars) < max(int(p) for p in ema_periods) + 5:
+        raise ValueError(f"not enough daily bars for {symbol}: {len(bars)}")
 
     closes = [float(b.c) for b in bars]
 
@@ -224,6 +213,7 @@ async def compute_daily_context(
     ema50_v = float(ema50[-1])
 
     ema21_slope = float(ema21[-1] - ema21[-2])
+    trend_strength_pct = (abs(ema21_slope) / last * 100.0) if last else 0.0
 
     anchor_idx = max(0, len(bars) - int(avwap_anchor_lookback))
     avwap = float(_anchored_vwap_daily(bars, anchor_idx))
@@ -232,25 +222,31 @@ async def compute_daily_context(
     fibs = _fib_levels(swing_low, swing_high)
     near = _nearest_level(last, fibs)
 
-    # Simple daily bias
+    # daily bias (with a "flat trend -> neutral" rule)
     price_above_ema50 = last > ema50_v
     ema21_above_ema50 = ema21_v > ema50_v
     ema9_above_ema21 = ema9_v > ema21_v
     ema21_up = ema21_slope > 0
     price_above_avwap = last > avwap
 
-    if price_above_ema50 and ema21_above_ema50 and ema21_up:
-        bias = "bullish"
-    elif (not price_above_ema50) and (not ema21_above_ema50) and (not ema21_up):
-        bias = "bearish"
-    else:
+    # if trend is extremely flat, avoid declaring bullish/bearish
+    if trend_strength_pct < 0.05:
         bias = "neutral"
+    else:
+        if price_above_ema50 and ema21_above_ema50 and ema21_up:
+            bias = "bullish"
+        elif (not price_above_ema50) and (not ema21_above_ema50) and (not ema21_up):
+            bias = "bearish"
+        else:
+            bias = "neutral"
+
+    dist_to_ema21_pct = _pct_dist(last, ema21_v)   # + means price above EMA21, - means below
+    dist_to_avwap_pct = _pct_dist(last, avwap)     # + means above AVWAP, - means below
 
     asof = datetime.fromtimestamp(bars[-1].t / 1000.0, tz=timezone.utc).isoformat()
 
-    # ✅ IMPORTANT: return a dict (NOT a tuple). No trailing comma here.
     return {
-        "symbol": symbol,
+        "symbol": (symbol or "").upper(),
         "asof": asof,
         "last_close": last,
         "ema": {
@@ -258,13 +254,18 @@ async def compute_daily_context(
             "ema21": ema21_v,
             "ema50": ema50_v,
             "ema21_slope": ema21_slope,
+            "trend_strength_pct": float(trend_strength_pct),
         },
         "avwap": {"value": avwap, "anchor": f"{int(avwap_anchor_lookback)}d_back"},
         "fib": {
             "swing_low": float(swing_low),
             "swing_high": float(swing_high),
             "levels": {k: float(v) for k, v in fibs.items()},
-            "nearest": near,  # near["level"] is string like "0.786"
+            "nearest": near,
+        },
+        "dist": {
+            "dist_to_ema21_pct": float(dist_to_ema21_pct),
+            "dist_to_avwap_pct": float(dist_to_avwap_pct),
         },
         "flags": {
             "price_above_ema50": bool(price_above_ema50),
