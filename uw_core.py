@@ -1,20 +1,17 @@
+# uw_core.py
 import os
 import asyncio
 import hashlib
 import logging
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
 from collections import OrderedDict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta, date
+from typing import Any, Dict, List, Optional
 
 import httpx
 import redis.asyncio as redis
 from zoneinfo import ZoneInfo
-
-from dataclasses import dataclass, field
-from datetime import date
-from typing import Any, Dict, List
 
 # ----------------------------
 # LOG
@@ -94,6 +91,7 @@ class CacheItem:
     value: Any
     expires_at: datetime
 
+
 @dataclass
 class State:
     running: bool = False
@@ -111,8 +109,13 @@ class State:
     sent_cache: "OrderedDict[str, float]" = field(default_factory=OrderedDict)
     sent_contract_cache: "OrderedDict[str, float]" = field(default_factory=OrderedDict)
 
+    # ✅ Daily summary accumulator (used by uw_handlers.py + daily_report.py)
     daily_alert_date: date | None = None
     daily_alerts: List[Dict[str, Any]] = field(default_factory=list)
+
+    # ✅ Background task registry (used by main.py start/stop)
+    tasks: Dict[str, asyncio.Task] = field(default_factory=dict)
+
 
 state = State()
 
@@ -131,6 +134,7 @@ def require_env() -> None:
         raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
     log.info("UW auth configured: token_present=%s token_len=%d", bool(UW_TOKEN), len(UW_TOKEN or ""))
 
+
 def bearerize(token: str) -> str:
     t = (token or "").strip()
     if not t:
@@ -139,14 +143,18 @@ def bearerize(token: str) -> str:
         return t
     return f"Bearer {t}"
 
+
 def uw_headers() -> Dict[str, str]:
     return {"Accept": "application/json", "Authorization": bearerize(UW_TOKEN)}
+
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+
 def now_et() -> datetime:
     return datetime.now(tz=ET)
+
 
 def market_hours_ok_now() -> bool:
     t = now_et()
@@ -158,6 +166,7 @@ def market_hours_ok_now() -> bool:
     end = t.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
     return start <= t <= end
 
+
 def safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
     try:
         if x is None:
@@ -165,6 +174,7 @@ def safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
         return float(x)
     except Exception:
         return default
+
 
 def safe_int(x: Any, default: Optional[int] = None) -> Optional[int]:
     try:
@@ -174,6 +184,7 @@ def safe_int(x: Any, default: Optional[int] = None) -> Optional[int]:
     except Exception:
         return default
 
+
 def parse_iso(dt_str: str) -> datetime:
     if not dt_str:
         return datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -182,24 +193,29 @@ def parse_iso(dt_str: str) -> datetime:
         s = s.replace("Z", "+00:00")
     return datetime.fromisoformat(s)
 
+
 def money(x: Optional[float]) -> str:
     if x is None:
         return "n/a"
     return f"${x:,.0f}"
 
+
 def sha16(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
 
 def normalize_contract(contract: str) -> str:
     return (contract or "").strip().upper()
 
+
 def stable_fingerprint(parts: List[str]) -> str:
-    norm = []
+    norm: List[str] = []
     for p in parts:
         s = (p or "").strip().upper()
         s = " ".join(s.split())
         norm.append(s)
     return sha16("|".join(norm))
+
 
 def _prune_ordered_cache(cache: "OrderedDict[str, float]", ttl: int, max_keys: int) -> None:
     now = time.time()
@@ -211,10 +227,12 @@ def _prune_ordered_cache(cache: "OrderedDict[str, float]", ttl: int, max_keys: i
     while len(cache) > max_keys:
         cache.popitem(last=False)
 
+
 def _mark_seen(cache: "OrderedDict[str, float]", key: str) -> None:
     now = time.time()
     cache[key] = now
     cache.move_to_end(key, last=True)
+
 
 def _seen_recently(cache: "OrderedDict[str, float]", key: str, ttl: int) -> bool:
     now = time.time()
@@ -223,10 +241,12 @@ def _seen_recently(cache: "OrderedDict[str, float]", key: str, ttl: int) -> bool
         return False
     return (now - ts) <= ttl
 
+
 # ----------------------------
 # Redis TTL Dedupe (optional)
 # ----------------------------
 _redis = None
+
 
 async def redis_client():
     global _redis
@@ -240,12 +260,15 @@ async def redis_client():
             _redis = None
     return _redis
 
+
 def _rk(kind: str, key: str) -> str:
     return f"{REDIS_PREFIX}:{kind}:{key}"
+
 
 async def redis_setnx_ttl(kind: str, key: str, ttl_seconds: int) -> bool:
     r = await redis_client()
     if not r:
+        # Redis disabled => "allow"
         return True
     try:
         redis_key = _rk(kind, key)
@@ -253,7 +276,9 @@ async def redis_setnx_ttl(kind: str, key: str, ttl_seconds: int) -> bool:
         return bool(ok)
     except Exception as e:
         log.error("Redis setnx failed kind=%s: %s", kind, e)
+        # fail-open
         return True
+
 
 async def redis_touch_ttl(kind: str, key: str, ttl_seconds: int) -> None:
     r = await redis_client()
@@ -264,6 +289,7 @@ async def redis_touch_ttl(kind: str, key: str, ttl_seconds: int) -> None:
         await r.set(redis_key, "1", ex=int(ttl_seconds))
     except Exception as e:
         log.error("Redis touch failed kind=%s: %s", kind, e)
+
 
 # ----------------------------
 # Async gates (Redis-first + in-mem)
@@ -278,6 +304,7 @@ async def dedupe_event_async(key: str) -> bool:
         return False
     _mark_seen(state.sent_cache, key)
     return True
+
 
 async def suppress_contract_async(contract: str) -> bool:
     c = normalize_contract(contract)
@@ -294,6 +321,7 @@ async def suppress_contract_async(contract: str) -> bool:
     _mark_seen(state.sent_contract_cache, c)
     return True
 
+
 async def cooldown_ok_async(key: str, seconds: int) -> bool:
     # check memory first (don’t burn redis keys)
     now = now_utc()
@@ -308,8 +336,10 @@ async def cooldown_ok_async(key: str, seconds: int) -> bool:
     state.cooldown[key] = now
     return True
 
+
 async def cooldown_ok_ticker_dir_async(ticker: str, opt_type: str, seconds: int = 900) -> bool:
     return await cooldown_ok_async(f"tdir:{ticker}:{(opt_type or 'UNK').upper()}", seconds)
+
 
 # ----------------------------
 # Legacy sync cooldown (kept)
@@ -326,6 +356,7 @@ def cooldown_ok(key: str) -> bool:
         state.cooldown = {k: v for k, v in state.cooldown.items() if v >= cutoff}
     return True
 
+
 # ----------------------------
 # UW HTTP
 # ----------------------------
@@ -334,8 +365,13 @@ async def uw_get(client: httpx.AsyncClient, path: str, params: Optional[Dict[str
     r = await client.get(url, headers=uw_headers(), params=params or {}, timeout=30)
 
     if r.status_code in (401, 403):
-        log.error("UW auth failed %s %s token_present=%s token_len=%d",
-                  r.status_code, path, bool(UW_TOKEN), len(UW_TOKEN or ""))
+        log.error(
+            "UW auth failed %s %s token_present=%s token_len=%d",
+            r.status_code,
+            path,
+            bool(UW_TOKEN),
+            len(UW_TOKEN or ""),
+        )
         try:
             raise RuntimeError(f"UW auth error {r.status_code}: {r.json()}")
         except Exception:
@@ -343,6 +379,7 @@ async def uw_get(client: httpx.AsyncClient, path: str, params: Optional[Dict[str
 
     r.raise_for_status()
     return r.json()
+
 
 # ----------------------------
 # Market Tide (cached)
@@ -358,6 +395,7 @@ async def get_market_tide(client: httpx.AsyncClient) -> Optional[Dict[str, Any]]
     except Exception:
         return None
 
+
 def summarize_market_tide(tide_json: Any) -> str:
     try:
         if isinstance(tide_json, dict) and isinstance(tide_json.get("data"), list) and tide_json["data"]:
@@ -366,7 +404,7 @@ def summarize_market_tide(tide_json: Any) -> str:
             put = safe_float(last.get("net_put_premium"))
             net = (call - put) if (call is not None and put is not None) else None
             ts = last.get("timestamp") or last.get("time") or last.get("tape_time") or ""
-            parts = []
+            parts: List[str] = []
             if net is not None:
                 parts.append(f"net `{money(net)}`")
             if call is not None:
@@ -379,6 +417,7 @@ def summarize_market_tide(tide_json: Any) -> str:
     except Exception:
         pass
     return "n/a"
+
 
 # ----------------------------
 # Darkpool (cached per ticker)
@@ -395,6 +434,7 @@ async def get_darkpool_for_ticker(client: httpx.AsyncClient, ticker: str) -> Opt
     except Exception:
         return None
 
+
 def summarize_darkpool(dp_json: Any) -> str:
     try:
         rows = dp_json.get("data") if isinstance(dp_json, dict) else dp_json
@@ -405,7 +445,7 @@ def summarize_darkpool(dp_json: Any) -> str:
         price = safe_float(top.get("price"))
         size = safe_int(top.get("size"))
         side = str(top.get("side") or "").lower()
-        parts = []
+        parts: List[str] = []
         if prem is not None:
             parts.append(f"top `{money(prem)}`")
         if size is not None:
@@ -421,22 +461,46 @@ def summarize_darkpool(dp_json: Any) -> str:
 
 __all__ = [
     # config
-    "WATCHLIST", "DEFAULT_WATCHLIST",
-    "FLOW_POLL_SECONDS", "CHAIN_POLL_SECONDS", "ALERTS_POLL_SECONDS",
-    "MIN_FLOW_PREMIUM", "MIN_FLOW_VOL_OI_RATIO", "FLOW_ASK_ONLY", "FLOW_LIMIT",
-    "CHAIN_VOL_OI_RATIO", "CHAIN_MIN_VOLUME", "CHAIN_MIN_OI",
-    "CHAIN_MIN_PREMIUM", "CHAIN_MIN_OI_CHANGE", "CHAIN_VOL_GREATER_OI_ONLY",
-    "MIN_HARD_VOLUME", "MIN_HARD_OI",
-    "MIN_SCORE_TO_ALERT", "COOLDOWN_SECONDS",
-    "FLOW_MAX_SEND_PER_CYCLE", "CHAINS_MAX_SEND_PER_CYCLE",
-
+    "UW_BASE_URL",
+    "WATCHLIST",
+    "DEFAULT_WATCHLIST",
+    "FLOW_POLL_SECONDS",
+    "CHAIN_POLL_SECONDS",
+    "ALERTS_POLL_SECONDS",
+    "MIN_FLOW_PREMIUM",
+    "MIN_FLOW_VOL_OI_RATIO",
+    "FLOW_ASK_ONLY",
+    "FLOW_LIMIT",
+    "CHAIN_VOL_OI_RATIO",
+    "CHAIN_MIN_VOLUME",
+    "CHAIN_MIN_OI",
+    "CHAIN_MIN_PREMIUM",
+    "CHAIN_MIN_OI_CHANGE",
+    "CHAIN_VOL_GREATER_OI_ONLY",
+    "MIN_HARD_VOLUME",
+    "MIN_HARD_OI",
+    "MIN_SCORE_TO_ALERT",
+    "COOLDOWN_SECONDS",
+    "FLOW_MAX_SEND_PER_CYCLE",
+    "CHAINS_MAX_SEND_PER_CYCLE",
+    "ENABLE_CUSTOM_ALERTS_FEED",
     # state + helpers
-    "state", "now_utc", "parse_iso", "safe_float", "safe_int", "money", "sha16",
-    "stable_fingerprint", "market_hours_ok_now",
-
+    "require_env",
+    "state",
+    "now_utc",
+    "now_et",
+    "market_hours_ok_now",
+    "parse_iso",
+    "safe_float",
+    "safe_int",
+    "money",
+    "sha16",
+    "stable_fingerprint",
     # uw api
-    "uw_get", "get_market_tide", "get_darkpool_for_ticker", "summarize_darkpool",
-
+    "uw_get",
+    "get_market_tide",
+    "get_darkpool_for_ticker",
+    "summarize_darkpool",
     # gates
     "cooldown_ok",  # legacy sync
     "cooldown_ok_async",
