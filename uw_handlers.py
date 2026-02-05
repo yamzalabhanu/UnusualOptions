@@ -10,7 +10,6 @@ from datetime import date
 from typing import Any, Dict, List, Tuple, Optional
 
 from zoneinfo import ZoneInfo
-
 import httpx
 
 from uw_core import (
@@ -48,19 +47,26 @@ from uw_core import (
     summarize_darkpool,
     stable_fingerprint,
     market_hours_ok_now,
+    # ✅ async/persistent gates
     cooldown_ok_async,
     cooldown_ok_ticker_dir_async,
     dedupe_event_async,
     suppress_contract_async,
 )
 
-from chatgpt import send_via_gpt_formatter, telegram_send
+# Telegram sender (plain text)
+from chatgpt import telegram_send
+
+# ✅ Daily technicals (EMA/AVWAP/Fib)
 from technicals_daily import compute_daily_context
+
+# ✅ NEW: local human formatter (no GPT) for concise summaries
+from alert_formatter import format_quick_summary
 
 log = logging.getLogger("uw_app.handlers")
 
 # ============================================================
-# CONFIG
+# PATCH CONFIG
 # ============================================================
 
 MIN_STRENGTH_10 = 8
@@ -69,29 +75,28 @@ MARKET_TIDE_NOTIONAL_THRESHOLD = 25_000_000
 DAY_TRADE_MAX_DTE = 7
 TICKER_DIR_COOLDOWN_SECONDS = 900
 
-# Daily technicals config
+# ✅ Daily technicals config
 POLYGON_API_KEY = (os.getenv("POLYGON_API_KEY", "") or "").strip()
 DAILY_TECH_TTL_SECONDS = int(os.getenv("DAILY_TECH_TTL_SECONDS", "1800"))  # 30 min
 DAILY_TECH_SWING_LOOKBACK = int(os.getenv("DAILY_TECH_SWING_LOOKBACK", "60"))
 DAILY_TECH_AVWAP_LOOKBACK = int(os.getenv("DAILY_TECH_AVWAP_LOOKBACK", "60"))
 
-# Daily summary recording timezone
+# ✅ Daily summary recording timezone
 CT = ZoneInfo("America/Chicago")
-
-# Accuracy knobs (can env-toggle later if you want)
-DAILY_DIST_CAUTION_PCT = float(os.getenv("DAILY_DIST_CAUTION_PCT", "1.5"))      # % away from EMA21/AVWAP
-BID_DOMINANCE_MULT = float(os.getenv("BID_DOMINANCE_MULT", "1.15"))             # bid > ask*1.15 => hedge-ish
-SWEEP_UPGRADE_MIN = int(os.getenv("SWEEP_UPGRADE_MIN", "300"))                 # sweeps >= 300 can offset downgrade
-REPEAT_CONFIRM_SECONDS = int(os.getenv("REPEAT_CONFIRM_SECONDS", "1200"))      # 20 min
-
-COUNTERTREND_EXCEPTIONAL_PREM = float(os.getenv("COUNTERTREND_EXCEPTIONAL_PREM", "10000000"))  # $10M
 
 
 # ============================================================
-# Daily report accumulator
+# Daily report accumulator (records sent alerts in-memory)
+# Requires uw_core.state to have:
+#   state.daily_alert_date
+#   state.daily_alerts
 # ============================================================
 
 def record_daily_alert(kind: str, payload: Dict[str, Any]) -> None:
+    """
+    Collect today's alerts for the 2:55pm CT daily summary.
+    Safe if state doesn't have attributes yet (will create them).
+    """
     today_ct = now_utc().astimezone(CT).date()
 
     if not hasattr(state, "daily_alert_date"):
@@ -191,8 +196,8 @@ def market_bias_from_tide(tide: Any) -> str:
 
     call_net = _as_float(last.get("net_call_premium"), 0.0)
     put_net = _as_float(last.get("net_put_premium"), 0.0)
-    net = call_net - put_net
 
+    net = call_net - put_net
     if net >= MARKET_TIDE_NOTIONAL_THRESHOLD:
         return "UP"
     if net <= -MARKET_TIDE_NOTIONAL_THRESHOLD:
@@ -218,15 +223,6 @@ def multileg_ratio(multileg_vol: Optional[int], vol: int) -> Optional[float]:
     return float(multileg_vol) / float(vol)
 
 
-def _ask_ratio(ask_vol: Optional[int], bid_vol: Optional[int]) -> Optional[float]:
-    if ask_vol is None or bid_vol is None:
-        return None
-    total = int(ask_vol) + int(bid_vol)
-    if total <= 0:
-        return None
-    return float(ask_vol) / float(total)
-
-
 def downgrade_steps_from_complexity(
     vol: int,
     oi: int,
@@ -234,6 +230,7 @@ def downgrade_steps_from_complexity(
     multileg_vol: Optional[int],
     ask_vol: Optional[int] = None,
     bid_vol: Optional[int] = None,
+    sweeps: Optional[int] = None,
 ) -> Tuple[int, str]:
     steps = 0
     notes: List[str] = []
@@ -255,12 +252,20 @@ def downgrade_steps_from_complexity(
             steps += 1
             notes.append(f"oiΔ={oi_chg} (drop)")
 
-    # mixed tape
-    ar = _ask_ratio(ask_vol, bid_vol)
-    if ar is not None:
-        if 0.42 <= ar <= 0.58:
+    if ask_vol is not None and bid_vol is not None and (ask_vol + bid_vol) > 0:
+        total = ask_vol + bid_vol
+        ask_ratio = ask_vol / total
+        if 0.42 <= ask_ratio <= 0.58:
             steps += 1
-            notes.append(f"prints_mixed ask%={ar:.2f}")
+            notes.append(f"prints_mixed ask%={ask_ratio:.2f}")
+        elif ask_ratio >= 0.65:
+            notes.append(f"ask%={ask_ratio:.2f} (urgency)")
+
+    if sweeps is not None:
+        if sweeps >= 1500:
+            notes.append(f"sweeps={sweeps} (high)")
+        elif sweeps >= 500:
+            notes.append(f"sweeps={sweeps}")
 
     steps = int(_clamp(float(steps), 0.0, 3.0))
 
@@ -281,15 +286,6 @@ def apply_tier_downgrade(tier: str, steps: int) -> str:
         return tier
     idx = order.index(tier)
     idx2 = min(len(order) - 1, idx + max(0, int(steps)))
-    return order[idx2]
-
-
-def apply_tier_upgrade(tier: str, steps: int) -> str:
-    order = ["Strong Buy", "Buy", "Moderate Buy", "Watch"]
-    if tier not in order:
-        return tier
-    idx = order.index(tier)
-    idx2 = max(0, idx - max(0, int(steps)))
     return order[idx2]
 
 
@@ -323,11 +319,8 @@ def recommendation_tier(
         elif voloi >= 1.2:
             score += 1
 
-    # prefer fresh positioning
     if oi_chg is not None:
-        if oi_chg >= 1500:
-            score += 4
-        elif oi_chg >= 500:
+        if oi_chg >= 500:
             score += 3
         elif oi_chg >= 100:
             score += 1
@@ -348,11 +341,11 @@ def recommendation_tier(
     if oi >= 50_000:
         score += 2
 
-    if score >= 22:
+    if score >= 20:
         tier = "Strong Buy"
-    elif score >= 15:
+    elif score >= 14:
         tier = "Buy"
-    elif score >= 10:
+    elif score >= 9:
         tier = "Moderate Buy"
     else:
         tier = "Watch"
@@ -367,7 +360,7 @@ def recommendation_tier(
 
 
 # ============================================================
-# Daily technicals cache + formatter
+# Daily technicals cache
 # ============================================================
 
 _daily_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -415,76 +408,12 @@ async def get_daily_context_cached(ticker: str, client: httpx.AsyncClient) -> Op
         return None
 
 
-def _fmt2(x: Optional[float]) -> str:
-    return "n/a" if x is None else f"{x:.2f}"
-
-
-def format_daily_context_line(ctx: Dict[str, Any]) -> str:
-    try:
-        bias = str(ctx.get("trend_bias") or "n/a")
-        ema = ctx.get("ema", {}) or {}
-        av = ctx.get("avwap", {}) or {}
-        fib = ctx.get("fib", {}) or {}
-        near = (fib.get("nearest") or {}) if isinstance(fib, dict) else {}
-        dist = ctx.get("dist", {}) or {}
-
-        ema9 = _as_float(ema.get("ema9"), None)
-        ema21 = _as_float(ema.get("ema21"), None)
-        ema50 = _as_float(ema.get("ema50"), None)
-        avwap = _as_float(av.get("value"), None)
-
-        nlevel = near.get("level", "n/a")
-        ndist = _as_float(near.get("dist_pct"), None)
-        ndist_s = "n/a" if ndist is None else f"{ndist:.2f}%"
-
-        d21 = _as_float(dist.get("dist_to_ema21_pct"), None)
-        dav = _as_float(dist.get("dist_to_avwap_pct"), None)
-        ts = _as_float(ema.get("trend_strength_pct"), None)
-
-        d21s = "n/a" if d21 is None else f"{d21:.2f}%"
-        davs = "n/a" if dav is None else f"{dav:.2f}%"
-        tss = "n/a" if ts is None else f"{ts:.2f}%"
-
-        return (
-            f"• DailyTech: bias=`{bias}` | EMA9/21/50=`{_fmt2(ema9)}/{_fmt2(ema21)}/{_fmt2(ema50)}` "
-            f"| AVWAP=`{_fmt2(avwap)}` | dEMA21=`{d21s}` dAVWAP=`{davs}` trend=`{tss}` | FibNear=`{nlevel}` ({ndist_s})"
-        )
-    except Exception:
-        return "• DailyTech: n/a"
-
-
-def daily_context_distance_steps(daily_ctx: Optional[Dict[str, Any]], opt_type: str) -> int:
-    """
-    Extra caution if trade is fighting daily AND price is meaningfully away from EMA21/AVWAP.
-    """
-    if not daily_ctx:
-        return 0
-
-    bias = str(daily_ctx.get("trend_bias") or "neutral").lower()
-    opt = str(opt_type or "").upper()
-    dist = daily_ctx.get("dist", {}) or {}
-
-    d21 = float(_as_float(dist.get("dist_to_ema21_pct"), 0.0))
-    dav = float(_as_float(dist.get("dist_to_avwap_pct"), 0.0))
-
-    # Note: dist values are (price - line)/price*100
-    # positive means price above; negative means below.
-    steps = 0
-
-    if opt == "CALL":
-        # bearish daily and also below EMA21/AVWAP by more than threshold
-        if bias == "bearish":
-            if d21 <= -DAILY_DIST_CAUTION_PCT or dav <= -DAILY_DIST_CAUTION_PCT:
-                steps += 1
-    elif opt == "PUT":
-        if bias == "bullish":
-            if d21 >= DAILY_DIST_CAUTION_PCT or dav >= DAILY_DIST_CAUTION_PCT:
-                steps += 1
-
-    return int(_clamp(float(steps), 0.0, 2.0))
-
-
 def daily_conflict_steps(daily_ctx: Optional[Dict[str, Any]], opt_type: str) -> int:
+    """
+    Simple downgrade if daily tape fights the option direction.
+    CALL vs bearish daily => -1 tier
+    PUT vs bullish daily => -1 tier
+    """
     if not daily_ctx:
         return 0
     bias = str(daily_ctx.get("trend_bias") or "neutral").lower()
@@ -496,88 +425,66 @@ def daily_conflict_steps(daily_ctx: Optional[Dict[str, Any]], opt_type: str) -> 
     return 0
 
 
-# ============================================================
-# Contract sanity filters (delta/DTE + moneyness)
-# ============================================================
-
-def _delta_ok(delta: Optional[float], dte: Optional[int]) -> bool:
-    if delta is None or dte is None:
-        return True  # don't block if missing
-    ad = abs(float(delta))
-    if dte <= 7:
-        return 0.30 <= ad <= 0.60
-    return 0.20 <= ad <= 0.55
-
-
-def _moneyness_ok(opt_type: str, strike: Optional[float], underlying: Optional[float], dte: Optional[int]) -> bool:
-    if strike is None or underlying is None or dte is None:
-        return True
-    strike = float(strike)
-    underlying = float(underlying)
-    if underlying <= 0:
-        return True
-
-    # short-DTE lottery filter
-    if dte <= 7:
-        if str(opt_type).upper() == "CALL":
-            return strike <= underlying * 1.08
-        if str(opt_type).upper() == "PUT":
-            return strike >= underlying * 0.92
-    return True
-
-
-# ============================================================
-# Market regime counter-trend gating
-# ============================================================
-
-def is_countertrend(market_bias: str, opt_type: str) -> bool:
-    mb = str(market_bias or "MIXED").upper()
-    ot = str(opt_type or "UNK").upper()
-    return (mb == "DOWN" and ot == "CALL") or (mb == "UP" and ot == "PUT")
-
-
-def countertrend_exceptional(
-    prem: float,
-    oi_chg: Optional[int],
-    ask_vol: Optional[int],
-    bid_vol: Optional[int],
-    voloi: Optional[float],
-) -> bool:
-    # exceptional = very large + fresh OI + more directional tape + decent vol/oi
-    if prem < COUNTERTREND_EXCEPTIONAL_PREM:
-        return False
-    if oi_chg is None or oi_chg < 1500:
-        return False
-    ar = _ask_ratio(ask_vol, bid_vol)
-    if ar is None or ar <= 0.55:
-        return False
-    if voloi is not None and float(voloi) < 2.0:
-        return False
-    return True
-
-
-# ============================================================
-# Repeat confirmation (two independent hits)
-# ============================================================
-
-def _repeat_confirm_steps(ticker: str, opt_type: str) -> int:
+def _daily_payload(daily_ctx: Optional[Dict[str, Any]], last_underlying: Optional[float] = None) -> Dict[str, Any]:
     """
-    If same ticker+direction repeats within window, upgrade by 1 step.
+    Convert compute_daily_context() output into a compact dict the formatter expects.
+    Also compute dEMA21 / dAVWAP / trend% vs last_underlying if provided.
     """
-    if not hasattr(state, "tdir_last_seen"):
-        state.tdir_last_seen = {}
+    if not daily_ctx:
+        return {}
 
-    key = f"{ticker}:{opt_type}"
-    now = now_utc()
+    ema = daily_ctx.get("ema") or {}
+    av = daily_ctx.get("avwap") or {}
+    fib = daily_ctx.get("fib") or {}
+    near = (fib.get("nearest") or {}) if isinstance(fib, dict) else {}
 
-    last = state.tdir_last_seen.get(key)
-    state.tdir_last_seen[key] = now
+    ema21 = safe_float(ema.get("ema21"))
+    avwap = safe_float(av.get("value"))
 
-    if last is None:
-        return 0
-    if (now - last).total_seconds() <= REPEAT_CONFIRM_SECONDS:
-        return 1
-    return 0
+    out = {
+        "bias": daily_ctx.get("trend_bias"),
+        "ema9": safe_float(ema.get("ema9")),
+        "ema21": ema21,
+        "ema50": safe_float(ema.get("ema50")),
+        "avwap": avwap,
+        "fib_near": near.get("level"),
+        "fib_dist_pct": safe_float(near.get("dist_pct")),
+    }
+
+    if last_underlying and ema21 and ema21 != 0:
+        out["dEMA21_pct"] = (float(last_underlying) - float(ema21)) / float(ema21) * 100.0
+    if last_underlying and avwap and avwap != 0:
+        out["dAVWAP_pct"] = (float(last_underlying) - float(avwap)) / float(avwap) * 100.0
+
+    # "trend" as EMA9 - EMA21 percent (simple)
+    ema9 = safe_float(ema.get("ema9"))
+    if ema9 and ema21 and ema21 != 0:
+        out["trend_pct"] = (float(ema9) - float(ema21)) / float(ema21) * 100.0
+
+    return out
+
+
+def _details_line(prem: float, vol: int, oi: int, oi_chg: Optional[int], voloi: Optional[float],
+                  ask_vol: Optional[int], bid_vol: Optional[int], sweeps: Optional[int],
+                  iv: Optional[float] = None) -> str:
+    tot = (ask_vol or 0) + (bid_vol or 0)
+    askp = (float(ask_vol) / tot) if (tot > 0 and ask_vol is not None) else None
+    parts = [
+        f"prem {money(prem)}",
+        f"vol {vol:,}",
+        f"oi {oi:,}",
+    ]
+    if oi_chg is not None:
+        parts.append(f"oiΔ {oi_chg:+d}")
+    if voloi is not None:
+        parts.append(f"vol/oi {voloi:.2f}")
+    if askp is not None:
+        parts.append(f"ask% {askp:.2f}")
+    if sweeps is not None:
+        parts.append(f"sweeps {sweeps:,}")
+    if iv is not None:
+        parts.append(f"iv {iv:.3f}")
+    return "Details: " + " | ".join(parts)
 
 
 # ============================================================
@@ -683,7 +590,6 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
 
     score = score_flow_alert(f)
     strength10 = strength_10_from_score(score)
-
     if strength10 < MIN_STRENGTH_10:
         return False
 
@@ -696,20 +602,14 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
 
     ticker = f["ticker"]
     opt_type = str(f.get("opt_type") or "").upper()
-    contract = f.get("contract") or ""
 
-    # --- Contract sanity filters ---
-    dte = dte_from_contract(contract)
-    if not _delta_ok(f.get("delta"), dte):
-        return False
-    if not _moneyness_ok(opt_type, f.get("strike"), f.get("underlying"), dte):
-        return False
-
-    # persistent ticker-direction cooldown
+    # ✅ persistent ticker-direction cooldown
     if not await cooldown_ok_ticker_dir_async(ticker, opt_type, TICKER_DIR_COOLDOWN_SECONDS):
         return False
 
-    # persistent cross-stream suppression
+    contract = f.get("contract") or ""
+
+    # ✅ persistent cross-stream suppression
     if not await suppress_contract_async(contract):
         return False
 
@@ -719,7 +619,7 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
             ticker,
             opt_type,
             contract,
-            str(int((prem or 0) / 1000)),
+            str(int((prem or 0) / 1000)),  # bucket premium $1k
             str(f.get("side") or ""),
             str(f.get("rule") or ""),
             str(f.get("strike") or ""),
@@ -727,9 +627,11 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
         ]
     )
 
+    # ✅ persistent event dedupe
     if not await dedupe_event_async("evt:" + fp):
         return False
 
+    # ✅ persistent cooldown per unique flow
     key = "flow:" + flow_alert_key(f)
     if not await cooldown_ok_async(key, COOLDOWN_SECONDS):
         return False
@@ -740,25 +642,23 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
 
     daily_ctx = await get_daily_context_cached(ticker, client)
 
-    # compute OIΔ if we have prev_oi
-    prev_oi = safe_int(a.get("prev_oi") or a.get("previous_open_interest") or a.get("prev_open_interest"))
-    oi_chg = (int(oi) - int(prev_oi)) if (prev_oi is not None and oi is not None) else None
-
-    tier, tier_reason = recommendation_tier(
+    tier, _tier_reason = recommendation_tier(
         opt_type=opt_type,
         strength10=strength10,
         premium_usd=prem,
         vol=int(vol),
         oi=int(oi),
         voloi=_as_float(f.get("vol_oi"), None) if f.get("vol_oi") is not None else None,
-        oi_chg=oi_chg,
+        oi_chg=None,
         market_bias=bias,
     )
 
     flow_multileg = safe_int(a.get("multi_leg_volume") or a.get("multi_leg") or a.get("multileg_volume"))
     flow_ask = safe_int(a.get("ask_volume") or a.get("askVol") or a.get("ask_volume_total"))
     flow_bid = safe_int(a.get("bid_volume") or a.get("bidVol") or a.get("bid_volume_total"))
-    flow_sweeps = safe_int(a.get("sweep_volume") or a.get("sweeps") or a.get("sweepVol") or a.get("sweep_volume_total"))
+    flow_sweeps = safe_int(a.get("sweep_volume") or a.get("sweeps") or a.get("sweepVol"))
+    prev_oi = safe_int(a.get("prev_oi") or a.get("previous_open_interest") or a.get("prev_open_interest"))
+    oi_chg = (int(oi) - int(prev_oi)) if (prev_oi is not None and oi is not None) else None
 
     downgrade_steps, flowtype_reason = downgrade_steps_from_complexity(
         vol=int(vol),
@@ -767,70 +667,68 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
         multileg_vol=flow_multileg,
         ask_vol=flow_ask,
         bid_vol=flow_bid,
+        sweeps=flow_sweeps,
     )
-
-    # hedge-ish: bid dominant
-    if flow_ask is not None and flow_bid is not None:
-        if int(flow_bid) > int(flow_ask) * BID_DOMINANCE_MULT:
-            downgrade_steps = int(_clamp(downgrade_steps + 1, 0, 3))
-            flowtype_reason += f", bid_dominant bid>{BID_DOMINANCE_MULT:.2f}xask"
-
-    # sweep + ask-side urgency can offset one downgrade
-    ar = _ask_ratio(flow_ask, flow_bid)
-    if flow_sweeps is not None and ar is not None:
-        if int(flow_sweeps) >= SWEEP_UPGRADE_MIN and ar > 0.55:
-            downgrade_steps = int(_clamp(downgrade_steps - 1, 0, 3))
-            flowtype_reason += f", sweeps={flow_sweeps} + ask%={ar:.2f} (urgency)"
-
     tier2 = apply_tier_downgrade(tier, downgrade_steps)
 
-    # daily conflict + daily distance caution
     conf_steps = daily_conflict_steps(daily_ctx, opt_type)
-    dist_steps = daily_context_distance_steps(daily_ctx, opt_type)
-    tier3 = apply_tier_downgrade(tier2, conf_steps + dist_steps)
-
-    # Counter-trend gating (strict)
-    vvoloi = _as_float(f.get("vol_oi"), None) if f.get("vol_oi") is not None else None
-    if is_countertrend(bias, opt_type):
-        if not countertrend_exceptional(prem, oi_chg, flow_ask, flow_bid, vvoloi):
-            # cap to Watch/Moderate depending on how strong it is
-            if tier3 in ("Strong Buy", "Buy"):
-                tier3 = "Moderate Buy"
-            else:
-                tier3 = apply_tier_downgrade(tier3, 1)
-            flowtype_reason += ", countertrend_not_exceptional"
-
-    # Repeat confirmation upgrade
-    repeat_up = _repeat_confirm_steps(ticker, opt_type)
-    if repeat_up > 0:
-        tier3 = apply_tier_upgrade(tier3, repeat_up)
-        flowtype_reason += ", repeat_confirm(+1)"
+    tier3 = apply_tier_downgrade(tier2, conf_steps)
 
     horizon = trade_horizon_label(contract)
+    dte = dte_from_contract(contract)
 
-    lines = [
-        f"🚨 *UW Flow Alert* — *{ticker}* | *Strength:* `{strength10}/10` | *Score:* `{score}/100`",
-        f"• Recommendation: *{tier3}* (base={tier}, complexity=-{downgrade_steps}, daily=-{conf_steps}, dist=-{dist_steps}) | BiasPref: `{('CALL' if bias=='UP' else 'PUT') if bias in ('UP','DOWN') else 'MIXED'}` | Horizon: *{horizon}*",
-        f"• FlowType: `{flowtype_reason}`",
-        f"• Type/Side: `{opt_type}` / `{str(f.get('side') or 'n/a')}` | Rule: `{f.get('rule')}`",
-        f"• Contract: `{contract or 'n/a'}`",
-        f"• Premium: *{money(prem)}* ({premium_bucket_label(prem)}) | Vol/OI: `{f.get('vol_oi')}` | Δ: `{f.get('delta')}` | OIΔ: `{oi_chg}`",
-        f"• Vol: `{vol}` | OI: `{oi}` | Underlying: `{f.get('underlying')}` | Strike: `{f.get('strike')}` | DTE: `{dte}`",
-    ]
+    # ✅ structured payload -> local formatter
+    alert_payload = {
+        "kind": "FLOW",
+        "ticker": ticker,
+        "opt_type": opt_type,
+        "contract": contract,
+        "expiry": f.get("expiry"),
+        "strike": f.get("strike"),
+        "dte": dte,
+        "premium": prem,
+        "premium_label": premium_bucket_label(prem),
+        "vol": int(vol),
+        "oi": int(oi),
+        "oi_chg": oi_chg,
+        "voloi": _as_float(f.get("vol_oi"), None),
+        "ask_vol": flow_ask,
+        "bid_vol": flow_bid,
+        "sweeps": flow_sweeps,
+        "multileg": flow_multileg,
+        "tier": tier3,
+        "strength10": int(strength10),
+        "score": int(score),
+        "horizon": horizon,
+        "market_bias": bias,
+        "market_tide_line": summarize_market_tide_compact(tide),
+        "darkpool_line": summarize_darkpool(dp),
+        "daily": _daily_payload(daily_ctx, last_underlying=f.get("underlying")),
+        "time": f.get("created_at"),
+        "flowtype_reason": flowtype_reason,
+        "downgrade_steps": downgrade_steps,
+        "daily_steps": conf_steps,
+    }
 
-    if daily_ctx:
-        lines.append(format_daily_context_line(daily_ctx))
+    summary = format_quick_summary(alert_payload)
 
-    lines += [
-        f"• MarketTide: {summarize_market_tide_compact(tide)}",
-        f"• Darkpool: {summarize_darkpool(dp)}",
-        f"• Model: `{tier_reason}`",
-        f"• Time: `{f.get('created_at')}`",
-    ]
+    # ✅ add compact Details line
+    details = _details_line(
+        prem=prem,
+        vol=int(vol),
+        oi=int(oi),
+        oi_chg=oi_chg,
+        voloi=_as_float(f.get("vol_oi"), None),
+        ask_vol=flow_ask,
+        bid_vol=flow_bid,
+        sweeps=flow_sweeps,
+        iv=None,
+    )
+    msg = summary + "\n" + details
 
-    msg = "\n".join(lines)
     await telegram_send(msg, client)
 
+    # ✅ record for daily summary
     record_daily_alert(
         "FLOW",
         {
@@ -923,11 +821,10 @@ def chain_strength_10(prem: float, vol: int, oi: int, voloi: Optional[float], oi
         elif voloi >= 1.2:
             s += 1
 
-    # prefer opening
     if oi_chg is not None:
-        if oi_chg >= 1500:
+        if oi_chg >= 500:
             s += 2
-        elif oi_chg >= 500:
+        elif oi_chg >= 100:
             s += 1
         elif oi_chg <= -500:
             s -= 1
@@ -999,11 +896,6 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
 
         opt_type = opt_type_from_contract(contract)
 
-        # delta/dte filters not available in chain rows; only DTE sanity (optional)
-        dte = dte_from_contract(contract)
-        if dte is not None and dte < -1:
-            continue
-
         if not await cooldown_ok_ticker_dir_async(ticker, opt_type, TICKER_DIR_COOLDOWN_SECONDS):
             continue
 
@@ -1031,10 +923,10 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         if strength10 < MIN_STRENGTH_10:
             continue
 
-        tier, tier_reason = recommendation_tier(opt_type, strength10, prem, vol, oi, voloi, oi_chg, bias)
+        tier, _tier_reason = recommendation_tier(opt_type, strength10, prem, vol, oi, voloi, oi_chg, bias)
 
-        askv = safe_int(f.get("ask_volume"))
-        bidv = safe_int(f.get("bid_volume"))
+        ask_vol = safe_int(f.get("ask_volume"))
+        bid_vol = safe_int(f.get("bid_volume"))
         sweeps = safe_int(f.get("sweep_volume"))
         multileg = safe_int(f.get("multi_leg_volume"))
 
@@ -1043,68 +935,68 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
             oi=oi,
             oi_chg=oi_chg,
             multileg_vol=multileg,
-            ask_vol=askv,
-            bid_vol=bidv,
+            ask_vol=ask_vol,
+            bid_vol=bid_vol,
+            sweeps=sweeps,
         )
-
-        # bid dominant
-        if askv is not None and bidv is not None:
-            if int(bidv) > int(askv) * BID_DOMINANCE_MULT:
-                downgrade_steps = int(_clamp(downgrade_steps + 1, 0, 3))
-                flowtype_reason += f", bid_dominant bid>{BID_DOMINANCE_MULT:.2f}xask"
-
-        # sweep urgency offset
-        ar = _ask_ratio(askv, bidv)
-        if sweeps is not None and ar is not None:
-            if int(sweeps) >= SWEEP_UPGRADE_MIN and ar > 0.55:
-                downgrade_steps = int(_clamp(downgrade_steps - 1, 0, 3))
-                flowtype_reason += f", sweeps={sweeps} + ask%={ar:.2f} (urgency)"
-
         tier2 = apply_tier_downgrade(tier, downgrade_steps)
 
         conf_steps = daily_conflict_steps(daily_ctx, opt_type)
-        dist_steps = daily_context_distance_steps(daily_ctx, opt_type)
-        tier3 = apply_tier_downgrade(tier2, conf_steps + dist_steps)
-
-        # Counter-trend gating
-        if is_countertrend(bias, opt_type):
-            if not countertrend_exceptional(prem, oi_chg, askv, bidv, voloi):
-                if tier3 in ("Strong Buy", "Buy"):
-                    tier3 = "Moderate Buy"
-                else:
-                    tier3 = apply_tier_downgrade(tier3, 1)
-                flowtype_reason += ", countertrend_not_exceptional"
-
-        # Repeat confirmation upgrade
-        repeat_up = _repeat_confirm_steps(ticker, opt_type)
-        if repeat_up > 0:
-            tier3 = apply_tier_upgrade(tier3, repeat_up)
-            flowtype_reason += ", repeat_confirm(+1)"
+        tier3 = apply_tier_downgrade(tier2, conf_steps)
 
         horizon = trade_horizon_label(contract)
+        dte = dte_from_contract(contract)
 
-        lines = [
-            f"🔥 *UW Unusual Chain* — *{ticker}* | *Strength:* `{strength10}/10`",
-            f"• Recommendation: *{tier3}* (base={tier}, complexity=-{downgrade_steps}, daily=-{conf_steps}, dist=-{dist_steps}) | BiasPref: `{('CALL' if bias=='UP' else 'PUT') if bias in ('UP','DOWN') else 'MIXED'}` | Horizon: *{horizon}*",
-            f"• FlowType: `{flowtype_reason}`",
-            f"• Contract: `{contract}` | Type: `{opt_type}` | DTE: `{dte}`",
-            f"• Premium: *{money(prem)}* ({premium_bucket_label(prem)}) | AvgPx: `{f.get('avg_price')}` | IV: `{f.get('iv')}`",
-            f"• Vol: `{vol}` | OI: `{oi}` | PrevOI: `{prev_oi}` | OIΔ: `{oi_chg}` | Vol/OI: `{voloi}`",
-            f"• AskVol: `{askv}` | BidVol: `{bidv}` | Sweeps: `{sweeps}` | MultiLeg: `{multileg}`",
-            f"• Triggers: `{', '.join(reasons)}`",
-        ]
+        # ✅ structured payload -> local formatter
+        alert_payload = {
+            "kind": "CHAIN",
+            "ticker": ticker,
+            "opt_type": opt_type,
+            "contract": contract,
+            "expiry": contract[4:10] if len(contract) >= 10 else None,
+            "strike": None,
+            "dte": dte,
+            "premium": float(prem),
+            "premium_label": premium_bucket_label(prem),
+            "vol": int(vol),
+            "oi": int(oi),
+            "oi_chg": int(oi_chg) if oi_chg is not None else None,
+            "voloi": float(voloi) if voloi is not None else None,
+            "ask_vol": ask_vol,
+            "bid_vol": bid_vol,
+            "sweeps": sweeps,
+            "multileg": multileg,
+            "iv": safe_float(f.get("iv")),
+            "tier": tier3,
+            "strength10": int(strength10),
+            "score": None,
+            "horizon": horizon,
+            "market_bias": bias,
+            "market_tide_line": summarize_market_tide_compact(tide),
+            "darkpool_line": summarize_darkpool(dp),
+            "daily": _daily_payload(daily_ctx),
+            "time": now_utc().isoformat(),
+            "flowtype_reason": flowtype_reason,
+            "downgrade_steps": downgrade_steps,
+            "daily_steps": conf_steps,
+            "triggers": ", ".join(reasons),
+        }
 
-        if daily_ctx:
-            lines.append(format_daily_context_line(daily_ctx))
+        summary = format_quick_summary(alert_payload)
 
-        lines += [
-            f"• MarketTide: {summarize_market_tide_compact(tide)}",
-            f"• Darkpool: {summarize_darkpool(dp)}",
-            f"• Model: `{tier_reason}`",
-            f"• Time: `{now_utc().isoformat()}`",
-        ]
+        details = _details_line(
+            prem=float(prem),
+            vol=vol,
+            oi=oi,
+            oi_chg=int(oi_chg) if oi_chg is not None else None,
+            voloi=float(voloi) if voloi is not None else None,
+            ask_vol=ask_vol,
+            bid_vol=bid_vol,
+            sweeps=sweeps,
+            iv=safe_float(f.get("iv")),
+        )
 
-        msg = "\n".join(lines)
+        msg = summary + "\n" + details
         await telegram_send(msg, client)
 
         record_daily_alert(
@@ -1156,6 +1048,7 @@ async def handle_custom_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> N
         return
 
     key = "alert:" + alert_key(a)
+
     now = now_utc()
     last = state.cooldown.get(key)
     if last and (now - last).total_seconds() < COOLDOWN_SECONDS:
@@ -1171,15 +1064,14 @@ async def handle_custom_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> N
     sym = a.get("symbol") or a.get("ticker") or ""
     ts = a.get("tape_time") or a.get("created_at") or ""
 
-    lines = [
-        f"🔔 *UW Custom Alert* — `{noti_type}`",
-        f"• Name: `{name}`",
-        f"• Symbol: `{sym}`",
-        f"• Payload: `{json.dumps(a)[:1500]}`",
-        f"• Time: `{ts}`",
-    ]
-
-    msg = "\n".join(lines)
+    # keep custom alerts short
+    msg = "\n".join(
+        [
+            f"{(sym or 'UNK').upper()} Custom Alert — {noti_type}",
+            f"Name: {name}",
+            f"Time: {ts or 'unknown'}",
+        ]
+    )
     await telegram_send(msg, client)
 
     record_daily_alert(
@@ -1199,7 +1091,7 @@ async def handle_custom_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> N
 
 
 # ============================================================
-# Background loops
+# Background loops  (EXPORT THESE)
 # ============================================================
 
 async def flow_loop() -> None:
