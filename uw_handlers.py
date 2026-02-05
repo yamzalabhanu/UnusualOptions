@@ -70,7 +70,7 @@ log = logging.getLogger("uw_app.handlers")
 # ============================================================
 
 MIN_STRENGTH_10 = 8
-VERY_LARGE_PREMIUM_USD = 2_000_000
+VERY_LARGE_PREMIUM_USD = 250_000
 MARKET_TIDE_NOTIONAL_THRESHOLD = 25_000_000
 DAY_TRADE_MAX_DTE = 7
 TICKER_DIR_COOLDOWN_SECONDS = 900
