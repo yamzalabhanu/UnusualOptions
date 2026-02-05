@@ -74,8 +74,52 @@ REDIS_ENABLED = bool(REDIS_URL)
 ENABLE_CUSTOM_ALERTS_FEED = os.getenv("ENABLE_CUSTOM_ALERTS_FEED", "0") == "1"
 
 DEFAULT_WATCHLIST = [
-    "NVDA", "AMD", "MSFT", "META", "AAPL", "TSLA", "AMZN", "GOOGL",
-    "PLTR", "CRWD", "SMCI", "MU", "ARM", "NFLX", "AVGO", "COIN", "MSTR"
+  # ===== Mega-cap / AI / Tech leaders =====
+    "NVDA","AAPL","MSFT","META","GOOGL","AMZN","AMD","AVGO",
+    "TSLA","NFLX","ORCL","CRM","NOW","TEAM","ADBE","SNOW",
+
+    # ===== Semis / Hardware =====
+    "MU","WDC","STX","INTC","TSM","ASML","NXPI","LRCX","TXN","QRVO","AMAT",
+
+    # ===== High options flow favorites =====
+    "PLTR","SMCI","MSTR","COIN","HOOD","SOFI","RBLX","U","TTWO",
+    "CRWD","DDOG","OKTA","NET","SHOP","ROKU","SQ","PYPL",
+
+    # ===== Financials =====
+    "JPM","GS","MS","BAC","WFC","C","AXP","V","MA","BRK.B",
+
+    # ===== Energy =====
+    "XOM","CVX",
+
+    # ===== Industrials / Defense =====
+    "LMT","CAT","GE",
+
+    # ===== Retail / Consumer =====
+    "WMT","COST","TGT","HD","LOW","SBUX","NKE",
+
+    # ===== Telecom =====
+    "T","VZ",
+
+    # ===== Healthcare / Biotech =====
+    "LLY","UNH","ABBV","PFE","MRNA","BNTX","REGN","GILD",
+
+    # ===== EV / Clean / Charging =====
+    "F","GM","NIO","LCID","BLNK",
+
+    # ===== Quantum / Nuclear / Alt-energy (high speculation flow) =====
+    "IONQ","QBTS","SMR","OKLO",
+
+    # ===== Crypto miners / proxies =====
+    "RIOT","MARA","BTBT",
+
+    # ===== Social / Internet =====
+    "SNAP","UBER","LYFT","ZM","DOCU",
+
+    # ===== High-vol meme / squeeze names =====
+    "GME","AMC","PLUG",
+
+    # ===== ETFs — MUST HAVE for options volume =====
+    "SPY","QQQ","IWM","DIA","SOXX","SMH","ARKK"
 ]
 
 # Market hours window (Eastern)
