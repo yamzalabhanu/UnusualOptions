@@ -1,4 +1,4 @@
-# uw_handlers.py
+# uw_handlers.py (FULLY MERGED + PATCHED PARSER + HUMAN SUMMARY)
 import asyncio
 import json
 import logging
@@ -60,7 +60,7 @@ from chatgpt import telegram_send
 # ✅ Daily technicals (EMA/AVWAP/Fib)
 from technicals_daily import compute_daily_context
 
-# ✅ NEW: local human formatter (no GPT) for concise summaries
+# ✅ local human formatter (no GPT) for concise summaries
 from alert_formatter import format_quick_summary
 
 log = logging.getLogger("uw_app.handlers")
@@ -84,19 +84,11 @@ DAILY_TECH_AVWAP_LOOKBACK = int(os.getenv("DAILY_TECH_AVWAP_LOOKBACK", "60"))
 # ✅ Daily summary recording timezone
 CT = ZoneInfo("America/Chicago")
 
-
 # ============================================================
-# Daily report accumulator (records sent alerts in-memory)
-# Requires uw_core.state to have:
-#   state.daily_alert_date
-#   state.daily_alerts
+# Daily report accumulator
 # ============================================================
 
 def record_daily_alert(kind: str, payload: Dict[str, Any]) -> None:
-    """
-    Collect today's alerts for the 2:55pm CT daily summary.
-    Safe if state doesn't have attributes yet (will create them).
-    """
     today_ct = now_utc().astimezone(CT).date()
 
     if not hasattr(state, "daily_alert_date"):
@@ -111,7 +103,6 @@ def record_daily_alert(kind: str, payload: Dict[str, Any]) -> None:
     payload = dict(payload or {})
     payload["kind"] = kind
     state.daily_alerts.append(payload)
-
 
 # ============================================================
 # Helpers
@@ -130,20 +121,43 @@ def _as_float(x: Any, default: Any = 0.0) -> Any:
     except Exception:
         return default
 
-
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
-
 
 def strength_10_from_score(score_100: int) -> int:
     score_100 = int(score_100 or 0)
     return max(0, min(10, int(math.ceil(score_100 / 10.0))))
 
+# ============================================================
+# ✅ PATCHED PARSER (fixes “Unknown”)
+# ============================================================
+
+def _norm_contract(contract: str) -> str:
+    return (contract or "").strip().upper()
+
+def opt_type_from_contract(contract: str) -> str:
+    c = _norm_contract(contract)
+    if not c:
+        return "UNK"
+
+    # semantic fallbacks
+    if "CALL" in c:
+        return "CALL"
+    if "PUT" in c:
+        return "PUT"
+
+    # OCC YYMMDD[C/P]
+    m = re.search(r"(\d{6})([CP])", c)
+    if m:
+        return "CALL" if m.group(2) == "C" else "PUT"
+
+    return "UNK"
 
 def parse_occ_expiry_from_contract(contract: str) -> Optional[date]:
-    if not contract:
+    c = _norm_contract(contract)
+    if not c:
         return None
-    m = re.search(r"(\d{6})([CP])", contract)
+    m = re.search(r"(\d{6})([CP])", c)
     if not m:
         return None
     yymmdd = m.group(1)
@@ -156,6 +170,57 @@ def parse_occ_expiry_from_contract(contract: str) -> Optional[date]:
     except Exception:
         return None
 
+def parse_strike_from_contract(contract: str) -> Optional[float]:
+    c = _norm_contract(contract)
+    if not c:
+        return None
+    # OCC strike: C/P + 8 digits, 3 decimals => /1000
+    m = re.search(r"[CP](\d{8})$", c)
+    if not m:
+        return None
+    try:
+        return int(m.group(1)) / 1000.0
+    except Exception:
+        return None
+
+def pick_contract_from_row(r: Dict[str, Any]) -> str:
+    for k in ("option_symbol", "option_contract", "occ_symbol", "contract_symbol", "contract", "symbol", "option"):
+        v = r.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+def pick_expiry_str(r: Dict[str, Any], contract: str) -> Optional[str]:
+    for k in ("expiry", "expiration", "exp_date", "expiration_date"):
+        v = r.get(k)
+        if v:
+            return str(v)
+    exp = parse_occ_expiry_from_contract(contract)
+    return exp.isoformat() if exp else None
+
+def pick_strike_float(r: Dict[str, Any], contract: str) -> Optional[float]:
+    for k in ("strike", "strike_price"):
+        v = r.get(k)
+        try:
+            if v is not None and str(v).strip() != "":
+                return float(v)
+        except Exception:
+            pass
+    return parse_strike_from_contract(contract)
+
+def pick_opt_type(r: Dict[str, Any], contract: str) -> str:
+    if bool(r.get("is_call")):
+        return "CALL"
+    if bool(r.get("is_put")):
+        return "PUT"
+    t = r.get("type")
+    if isinstance(t, str) and t.strip():
+        tt = t.strip().upper()
+        if tt in ("CALL", "PUT"):
+            return tt
+    return opt_type_from_contract(contract)
+
+# ============================================================
 
 def dte_from_contract(contract: str) -> Optional[int]:
     exp = parse_occ_expiry_from_contract(contract)
@@ -164,13 +229,11 @@ def dte_from_contract(contract: str) -> Optional[int]:
     today = now_utc().date()
     return (exp - today).days
 
-
 def trade_horizon_label(contract: str) -> str:
     dte = dte_from_contract(contract)
     if dte is None:
         return "unknown horizon"
     return "day trade" if dte <= DAY_TRADE_MAX_DTE else "swing trade"
-
 
 def premium_bucket_label(prem: float) -> str:
     if prem >= 10_000_000:
@@ -182,7 +245,6 @@ def premium_bucket_label(prem: float) -> str:
     if prem >= 500_000:
         return "large"
     return "small"
-
 
 def market_bias_from_tide(tide: Any) -> str:
     if not isinstance(tide, dict):
@@ -196,14 +258,13 @@ def market_bias_from_tide(tide: Any) -> str:
 
     call_net = _as_float(last.get("net_call_premium"), 0.0)
     put_net = _as_float(last.get("net_put_premium"), 0.0)
-
     net = call_net - put_net
+
     if net >= MARKET_TIDE_NOTIONAL_THRESHOLD:
         return "UP"
     if net <= -MARKET_TIDE_NOTIONAL_THRESHOLD:
         return "DOWN"
     return "MIXED"
-
 
 def summarize_market_tide_compact(tide: Any) -> str:
     if not isinstance(tide, dict) or not isinstance(tide.get("data"), list) or not tide["data"]:
@@ -216,12 +277,10 @@ def summarize_market_tide_compact(tide: Any) -> str:
     bias = market_bias_from_tide(tide)
     return f"bias={bias} | net={money(net)} call={money(call_net)} put={money(put_net)} | t={ts}"
 
-
 def multileg_ratio(multileg_vol: Optional[int], vol: int) -> Optional[float]:
     if multileg_vol is None or not vol or vol <= 0:
         return None
     return float(multileg_vol) / float(vol)
-
 
 def downgrade_steps_from_complexity(
     vol: int,
@@ -279,7 +338,6 @@ def downgrade_steps_from_complexity(
     expl = ", ".join(notes) if notes else "no complexity flags"
     return steps, f"{flowtype} | {expl}"
 
-
 def apply_tier_downgrade(tier: str, steps: int) -> str:
     order = ["Strong Buy", "Buy", "Moderate Buy", "Watch"]
     if tier not in order:
@@ -287,7 +345,6 @@ def apply_tier_downgrade(tier: str, steps: int) -> str:
     idx = order.index(tier)
     idx2 = min(len(order) - 1, idx + max(0, int(steps)))
     return order[idx2]
-
 
 def recommendation_tier(
     opt_type: str,
@@ -358,13 +415,11 @@ def recommendation_tier(
     reason += f" market={market_bias}"
     return tier, reason
 
-
 # ============================================================
 # Daily technicals cache
 # ============================================================
 
 _daily_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-
 
 def _daily_cache_get(key: str) -> Optional[Dict[str, Any]]:
     item = _daily_cache.get(key)
@@ -376,10 +431,8 @@ def _daily_cache_get(key: str) -> Optional[Dict[str, Any]]:
         return None
     return val
 
-
 def _daily_cache_set(key: str, val: Dict[str, Any], ttl: int) -> None:
     _daily_cache[key] = (time.time() + ttl, val)
-
 
 async def get_daily_context_cached(ticker: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     if not POLYGON_API_KEY:
@@ -407,13 +460,7 @@ async def get_daily_context_cached(ticker: str, client: httpx.AsyncClient) -> Op
         log.info("daily_context_failed %s: %s", ticker, e)
         return None
 
-
 def daily_conflict_steps(daily_ctx: Optional[Dict[str, Any]], opt_type: str) -> int:
-    """
-    Simple downgrade if daily tape fights the option direction.
-    CALL vs bearish daily => -1 tier
-    PUT vs bullish daily => -1 tier
-    """
     if not daily_ctx:
         return 0
     bias = str(daily_ctx.get("trend_bias") or "neutral").lower()
@@ -424,12 +471,7 @@ def daily_conflict_steps(daily_ctx: Optional[Dict[str, Any]], opt_type: str) -> 
         return 1
     return 0
 
-
 def _daily_payload(daily_ctx: Optional[Dict[str, Any]], last_underlying: Optional[float] = None) -> Dict[str, Any]:
-    """
-    Convert compute_daily_context() output into a compact dict the formatter expects.
-    Also compute dEMA21 / dAVWAP / trend% vs last_underlying if provided.
-    """
     if not daily_ctx:
         return {}
 
@@ -456,24 +498,27 @@ def _daily_payload(daily_ctx: Optional[Dict[str, Any]], last_underlying: Optiona
     if last_underlying and avwap and avwap != 0:
         out["dAVWAP_pct"] = (float(last_underlying) - float(avwap)) / float(avwap) * 100.0
 
-    # "trend" as EMA9 - EMA21 percent (simple)
     ema9 = safe_float(ema.get("ema9"))
     if ema9 and ema21 and ema21 != 0:
         out["trend_pct"] = (float(ema9) - float(ema21)) / float(ema21) * 100.0
 
     return out
 
-
-def _details_line(prem: float, vol: int, oi: int, oi_chg: Optional[int], voloi: Optional[float],
-                  ask_vol: Optional[int], bid_vol: Optional[int], sweeps: Optional[int],
-                  iv: Optional[float] = None) -> str:
+def _details_line(
+    prem: float,
+    vol: int,
+    oi: int,
+    oi_chg: Optional[int],
+    voloi: Optional[float],
+    ask_vol: Optional[int],
+    bid_vol: Optional[int],
+    sweeps: Optional[int],
+    iv: Optional[float] = None,
+) -> str:
     tot = (ask_vol or 0) + (bid_vol or 0)
     askp = (float(ask_vol) / tot) if (tot > 0 and ask_vol is not None) else None
-    parts = [
-        f"prem {money(prem)}",
-        f"vol {vol:,}",
-        f"oi {oi:,}",
-    ]
+
+    parts = [f"prem {money(prem)}", f"vol {vol:,}", f"oi {oi:,}"]
     if oi_chg is not None:
         parts.append(f"oiΔ {oi_chg:+d}")
     if voloi is not None:
@@ -486,29 +531,39 @@ def _details_line(prem: float, vol: int, oi: int, oi_chg: Optional[int], voloi: 
         parts.append(f"iv {iv:.3f}")
     return "Details: " + " | ".join(parts)
 
-
 # ============================================================
 # Flow helpers
 # ============================================================
 
 def get_flow_fields(a: Dict[str, Any]) -> Dict[str, Any]:
+    contract = _norm_contract(str(
+        a.get("option_symbol")
+        or a.get("contract")
+        or a.get("option_chain")
+        or a.get("symbol")
+        or ""
+    ))
+
+    opt_type = pick_opt_type(a, contract)
+    strike = pick_strike_float(a, contract)
+    expiry = pick_expiry_str(a, contract)
+
     return {
-        "ticker": str(a.get("ticker_symbol") or a.get("ticker") or a.get("symbol") or "UNK").upper(),
-        "opt_type": "CALL" if bool(a.get("is_call")) else ("PUT" if bool(a.get("is_put")) else str(a.get("type") or "").upper()),
+        "ticker": str(a.get("ticker_symbol") or a.get("ticker") or a.get("underlying_ticker") or "UNK").upper(),
+        "opt_type": opt_type,
+        "strike": strike,
+        "expiry": expiry,
         "premium": safe_float(a.get("total_premium") or a.get("premium") or a.get("notional") or a.get("total_notional")),
         "vol_oi": safe_float(a.get("min_volume_oi_ratio") or a.get("volume_oi_ratio") or a.get("vol_oi_ratio") or a.get("volume_oi")),
         "side": "ask" if bool(a.get("is_ask_side")) else ("bid" if bool(a.get("is_bid_side")) else str(a.get("side") or a.get("trade_side") or "")),
-        "strike": safe_float(a.get("strike")),
-        "expiry": a.get("expiry") or a.get("expiration") or a.get("exp_date"),
         "delta": safe_float(a.get("delta") or a.get("option_delta")),
         "oi": safe_int(a.get("open_interest")),
         "volume": safe_int(a.get("volume")),
         "created_at": a.get("created_at") or a.get("tape_time"),
         "rule": a.get("alert_rule") or a.get("rule_name") or a.get("rule") or "FLOW",
-        "contract": a.get("option_symbol") or a.get("contract") or a.get("option_chain") or "",
+        "contract": contract,
         "underlying": safe_float(a.get("underlying_price") or a.get("underlying") or a.get("stock_price") or a.get("spot_price")),
     }
-
 
 def score_flow_alert(f: Dict[str, Any]) -> int:
     score = 50
@@ -542,7 +597,6 @@ def score_flow_alert(f: Dict[str, Any]) -> int:
 
     return max(0, min(100, score))
 
-
 async def fetch_flow_alerts(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     params: Dict[str, Any] = {
         "min_premium": MIN_FLOW_PREMIUM,
@@ -561,7 +615,6 @@ async def fetch_flow_alerts(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     rows = data.get("data") if isinstance(data, dict) else data
     return rows if isinstance(rows, list) else []
 
-
 def flow_alert_key(f: Dict[str, Any]) -> str:
     raw = "|".join(
         [
@@ -575,7 +628,6 @@ def flow_alert_key(f: Dict[str, Any]) -> str:
         ]
     )
     return sha16(raw)
-
 
 async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> bool:
     if not market_hours_ok_now():
@@ -601,15 +653,18 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
         return False
 
     ticker = f["ticker"]
-    opt_type = str(f.get("opt_type") or "").upper()
+    contract = f.get("contract") or ""
+    opt_type = pick_opt_type(a, contract)
 
-    # ✅ persistent ticker-direction cooldown
+    # helpful debug if still UNK
+    if opt_type == "UNK":
+        log.warning("UNKNOWN opt_type FLOW. ticker=%s contract=%s keys=%s", ticker, contract, list(a.keys())[:40])
+
+    # ✅ ticker-direction cooldown
     if not await cooldown_ok_ticker_dir_async(ticker, opt_type, TICKER_DIR_COOLDOWN_SECONDS):
         return False
 
-    contract = f.get("contract") or ""
-
-    # ✅ persistent cross-stream suppression
+    # ✅ cross-stream suppression
     if not await suppress_contract_async(contract):
         return False
 
@@ -619,7 +674,7 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
             ticker,
             opt_type,
             contract,
-            str(int((prem or 0) / 1000)),  # bucket premium $1k
+            str(int((prem or 0) / 1000)),
             str(f.get("side") or ""),
             str(f.get("rule") or ""),
             str(f.get("strike") or ""),
@@ -627,11 +682,9 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
         ]
     )
 
-    # ✅ persistent event dedupe
     if not await dedupe_event_async("evt:" + fp):
         return False
 
-    # ✅ persistent cooldown per unique flow
     key = "flow:" + flow_alert_key(f)
     if not await cooldown_ok_async(key, COOLDOWN_SECONDS):
         return False
@@ -677,7 +730,6 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
     horizon = trade_horizon_label(contract)
     dte = dte_from_contract(contract)
 
-    # ✅ structured payload -> local formatter
     alert_payload = {
         "kind": "FLOW",
         "ticker": ticker,
@@ -711,8 +763,6 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
     }
 
     summary = format_quick_summary(alert_payload)
-
-    # ✅ add compact Details line
     details = _details_line(
         prem=prem,
         vol=int(vol),
@@ -724,11 +774,9 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
         sweeps=flow_sweeps,
         iv=None,
     )
-    msg = summary + "\n" + details
 
-    await telegram_send(msg, client)
+    await telegram_send(summary + "\n" + details, client)
 
-    # ✅ record for daily summary
     record_daily_alert(
         "FLOW",
         {
@@ -747,26 +795,32 @@ async def handle_flow_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> boo
 
     return True
 
-
 # ============================================================
 # Chain scanner
 # ============================================================
 
 def chain_row_fields(r: Dict[str, Any]) -> Dict[str, Any]:
+    contract = _norm_contract(pick_contract_from_row(r))
+    opt_type = pick_opt_type(r, contract)
+    strike = pick_strike_float(r, contract)
+    expiry = pick_expiry_str(r, contract)
+
     return {
-        "option_symbol": r.get("option_symbol") or r.get("option_contract") or r.get("symbol") or "",
+        "option_symbol": contract,
+        "opt_type": opt_type,
+        "strike": strike,
+        "expiry": expiry,
         "volume": safe_int(r.get("volume")),
         "open_interest": safe_int(r.get("open_interest")),
         "prev_oi": safe_int(r.get("prev_oi")),
         "total_premium": safe_float(r.get("total_premium") or r.get("premium") or r.get("notional")),
         "avg_price": safe_float(r.get("avg_price")),
-        "iv": safe_float(r.get("implied_volatility")),
+        "iv": safe_float(r.get("implied_volatility") or r.get("iv")),
         "ask_volume": safe_int(r.get("ask_volume")),
         "bid_volume": safe_int(r.get("bid_volume")),
         "sweep_volume": safe_int(r.get("sweep_volume")),
         "multi_leg_volume": safe_int(r.get("multi_leg_volume")),
     }
-
 
 def chain_is_unusual(f: Dict[str, Any]) -> Tuple[bool, List[str]]:
     vol = f.get("volume") or 0
@@ -801,7 +855,6 @@ def chain_is_unusual(f: Dict[str, Any]) -> Tuple[bool, List[str]]:
     real_triggers = [r for r in reasons if r.startswith(("prem>=", "vol/oi>=", "oi_chg>="))]
     return (len(real_triggers) > 0), reasons
 
-
 def chain_strength_10(prem: float, vol: int, oi: int, voloi: Optional[float], oi_chg: Optional[int]) -> int:
     s = 4
     if prem >= 10_000_000:
@@ -835,16 +888,6 @@ def chain_strength_10(prem: float, vol: int, oi: int, voloi: Optional[float], oi
         s += 1
     return max(0, min(10, s))
 
-
-def opt_type_from_contract(contract: str) -> str:
-    if not contract:
-        return "UNK"
-    m = re.search(r"\d{6}([CP])", contract)
-    if not m:
-        return "UNK"
-    return "CALL" if m.group(1) == "C" else "PUT"
-
-
 async def fetch_option_contracts(client: httpx.AsyncClient, ticker: str) -> List[Dict[str, Any]]:
     params: Dict[str, Any] = {"limit": 500, "exclude_zero_vol_chains": "true", "exclude_zero_oi_chains": "true"}
     if CHAIN_VOL_GREATER_OI_ONLY:
@@ -853,7 +896,6 @@ async def fetch_option_contracts(client: httpx.AsyncClient, ticker: str) -> List
     data = await uw_get(client, f"/api/stock/{ticker}/option-contracts", params=params)
     rows = data.get("data") if isinstance(data, dict) else data
     return rows if isinstance(rows, list) else []
-
 
 async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str) -> int:
     if not market_hours_ok_now():
@@ -882,7 +924,6 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
     tide = await get_market_tide(client)
     dp = await get_darkpool_for_ticker(client, ticker)
     bias = market_bias_from_tide(tide)
-
     daily_ctx = await get_daily_context_cached(ticker, client)
 
     sent = 0
@@ -894,11 +935,12 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         if prem < VERY_LARGE_PREMIUM_USD:
             continue
 
-        opt_type = opt_type_from_contract(contract)
+        opt_type = f.get("opt_type") or opt_type_from_contract(contract)
+        if opt_type == "UNK":
+            log.warning("UNKNOWN opt_type CHAIN. ticker=%s contract=%s", ticker, contract)
 
         if not await cooldown_ok_ticker_dir_async(ticker, opt_type, TICKER_DIR_COOLDOWN_SECONDS):
             continue
-
         if not await suppress_contract_async(contract):
             continue
 
@@ -947,14 +989,13 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         horizon = trade_horizon_label(contract)
         dte = dte_from_contract(contract)
 
-        # ✅ structured payload -> local formatter
         alert_payload = {
             "kind": "CHAIN",
             "ticker": ticker,
             "opt_type": opt_type,
             "contract": contract,
-            "expiry": contract[4:10] if len(contract) >= 10 else None,
-            "strike": None,
+            "expiry": f.get("expiry"),
+            "strike": f.get("strike"),
             "dte": dte,
             "premium": float(prem),
             "premium_label": premium_bucket_label(prem),
@@ -983,7 +1024,6 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
         }
 
         summary = format_quick_summary(alert_payload)
-
         details = _details_line(
             prem=float(prem),
             vol=vol,
@@ -996,8 +1036,7 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
             iv=safe_float(f.get("iv")),
         )
 
-        msg = summary + "\n" + details
-        await telegram_send(msg, client)
+        await telegram_send(summary + "\n" + details, client)
 
         record_daily_alert(
             "CHAIN",
@@ -1016,7 +1055,6 @@ async def scan_unusual_chains_for_ticker(client: httpx.AsyncClient, ticker: str)
 
     return sent
 
-
 # ============================================================
 # Optional custom alerts feed
 # ============================================================
@@ -1029,7 +1067,6 @@ async def fetch_custom_alerts(client: httpx.AsyncClient) -> List[Dict[str, Any]]
     rows = data.get("data") if isinstance(data, dict) else data
     return rows if isinstance(rows, list) else []
 
-
 def alert_key(a: Dict[str, Any]) -> str:
     raw = "|".join(
         [
@@ -1041,7 +1078,6 @@ def alert_key(a: Dict[str, Any]) -> str:
         ]
     )
     return sha16(raw)
-
 
 async def handle_custom_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> None:
     if not market_hours_ok_now():
@@ -1064,7 +1100,6 @@ async def handle_custom_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> N
     sym = a.get("symbol") or a.get("ticker") or ""
     ts = a.get("tape_time") or a.get("created_at") or ""
 
-    # keep custom alerts short
     msg = "\n".join(
         [
             f"{(sym or 'UNK').upper()} Custom Alert — {noti_type}",
@@ -1088,7 +1123,6 @@ async def handle_custom_alert(client: httpx.AsyncClient, a: Dict[str, Any]) -> N
 
     if ts:
         state.alerts_newer_than = ts
-
 
 # ============================================================
 # Background loops  (EXPORT THESE)
@@ -1114,7 +1148,6 @@ async def flow_loop() -> None:
 
             await asyncio.sleep(FLOW_POLL_SECONDS)
 
-
 async def chains_loop() -> None:
     async with httpx.AsyncClient() as client:
         while state.running:
@@ -1129,7 +1162,6 @@ async def chains_loop() -> None:
                 pass
 
             await asyncio.sleep(CHAIN_POLL_SECONDS)
-
 
 async def custom_alerts_loop() -> None:
     async with httpx.AsyncClient() as client:
@@ -1146,6 +1178,5 @@ async def custom_alerts_loop() -> None:
                 pass
 
             await asyncio.sleep(ALERTS_POLL_SECONDS)
-
 
 __all__ = ["flow_loop", "chains_loop", "custom_alerts_loop"]
